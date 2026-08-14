@@ -33,20 +33,17 @@ def parse_event_markets(event_data):
         return bucket_prices
 
     for market in event_data.get('markets', []):
-        # Extract temperature bucket title (e.g., "31°C", "32°C or higher")
         bucket = market.get('groupItemTitle') or market.get('question')
         raw_prices = market.get('outcomePrices')
         
         if bucket and raw_prices:
-            # Polymarket prices are JSON arrays formatted like ["0.25", "0.75"]
             prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
             if prices:
-                bucket_prices[bucket] = float(prices[0]) # YES price
+                bucket_prices[bucket] = float(prices[0]) # YES price / implied probability
     return bucket_prices
 
 def get_polymarket_prices(city_name, city_slug, target_date_str):
     """Fetches Polymarket bucket prices using exact slug lookups with search fallback."""
-    # Format date components (e.g. "2026-08-15" -> month="august", day=15, year=2026)
     dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     month_name = dt.strftime("%B").lower()
     day = dt.day
@@ -65,7 +62,7 @@ def get_polymarket_prices(city_name, city_slug, target_date_str):
     except Exception as e:
         print(f"[Warning] Slug lookup failed for {city_slug}: {e}")
 
-    # Method 2: Query Search Fallback
+    # Method 2: Search Fallback
     url_search = "https://gamma-api.polymarket.com/events"
     params = {"active": "true", "closed": "false", "q": city_name}
 
@@ -86,9 +83,25 @@ def get_polymarket_prices(city_name, city_slug, target_date_str):
 
     return {}
 
+def format_buckets_readable(bucket_dict):
+    """Converts a dictionary of prices into a clean human-readable percentage list."""
+    if not bucket_dict:
+        return "No market data"
+    
+    formatted = []
+    # Sort items by temperature or bucket key if possible
+    for bucket, price in bucket_dict.items():
+        pct = price * 100
+        if pct >= 0.5: # Filter out extremely tiny noise (< 0.5%)
+            formatted.append(f"{bucket}: {pct:.1f}%")
+            
+    return " | ".join(formatted)
+
 def log_snapshot():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     records = []
+    
+    print(f"\n=================== SNAPSHOT LOG [{now_utc}] ===================")
     
     for city_name, info in CITIES.items():
         try:
@@ -97,6 +110,7 @@ def log_snapshot():
             
             predicted_bucket = f"{int(round(ecmwf_t))}°C"
             matching_price = poly_prices.get(predicted_bucket, None)
+            readable_dist = format_buckets_readable(poly_prices)
             
             records.append({
                 'timestamp_utc': now_utc,
@@ -106,18 +120,27 @@ def log_snapshot():
                 'gfs_max_c': gfs_t,
                 'predicted_bucket': predicted_bucket,
                 'polymarket_price': matching_price,
-                'all_bucket_prices': json.dumps(poly_prices)
+                'readable_distribution': readable_dist,
+                'raw_bucket_prices': json.dumps(poly_prices, ensure_ascii=False)
             })
-            print(f"[{now_utc}] Logged {city_name} for {target_date} -> Forecast: {predicted_bucket}, Poly Price: {matching_price}")
+            
+            # Print highly readable output to console/GitHub Actions log
+            print(f"[{city_name} | {target_date}]")
+            print(f"  Forecasts: ECMWF = {ecmwf_t}°C (Bucket: {predicted_bucket}) | GFS = {gfs_t}°C")
+            print(f"  Poly Price ({predicted_bucket}): {matching_price if matching_price is not None else 'N/A'}")
+            print(f"  Market Odds: {readable_dist}\n")
+            
         except Exception as e:
             print(f"Error processing {city_name}: {e}")
             
     if records:
         df = pd.DataFrame(records)
         if os.path.exists(CSV_FILE):
-            df.to_csv(CSV_FILE, mode='a', header=False, index=False)
+            df.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
         else:
-            df.to_csv(CSV_FILE, mode='w', header=True, index=False)
+            df.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
+            
+    print("===================================================================\n")
 
 if __name__ == "__main__":
     log_snapshot()
