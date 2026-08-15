@@ -91,8 +91,51 @@ its generation and writes them to separate files.
 
 ## Known open item
 
-Settlement still uses the Open-Meteo Archive proxy, not the official
-per-city Wunderground/HKO station data. This is flagged, not silently
-assumed correct — see the note at the top of `settle_outcomes.py`.
-Building a real station scraper is the highest-value next step for
-backtest fidelity.
+~~Settlement still uses the Open-Meteo Archive proxy, not the official
+per-city Wunderground/HKO station data.~~ **Partially resolved (2026-08
+update):** real official sources are now wired in for 4 of 14 cities:
+
+| City | Official source | Implementation |
+|---|---|---|
+| New York | NOAA/NWS, LaGuardia (KLGA) | `official_settlement_sources.py` |
+| Chicago | NOAA/NWS, O'Hare (KORD) | `official_settlement_sources.py` |
+| Miami | NOAA/NWS, Miami Intl (KMIA) | `official_settlement_sources.py` |
+| Hong Kong | Hong Kong Observatory open data | `official_settlement_sources.py` |
+
+These 3 NOAA stations are confirmed by name in Polymarket's own live
+market rules pages, and NOAA's `api.weather.gov` reports the same
+underlying ASOS/METAR feed Wunderground displays for these airport
+stations — no API key needed. HKO's field-name parsing in
+`fetch_hko_daily_max_c` was written from documented API structure but
+**not verified against a live response** (no network access in the
+environment it was built in) — check the console output the first time
+it runs for a "response shape unrecognized" warning, and adjust field
+names in that function if needed.
+
+The remaining 10 cities (Tokyo, Shanghai, Qingdao, Seoul, Guangzhou,
+Shenzhen, London, Paris, Ankara, Buenos Aires) still use the Open-Meteo
+proxy — Wunderground has no public API for non-US stations, and
+scraping their site directly was deliberately not attempted (fragile,
+JS-rendered, ToS considerations). Building that out is the natural next
+step for full coverage.
+
+New columns from this change:
+- `actual_max_c_official` — real value, only populated for the 4 cities
+  above, `NaN` otherwise.
+- `actual_max_c_openmeteo_proxy` — **always** computed for every city,
+  even the 4 with an official source, so you can empirically compare
+  proxy-vs-official accuracy once enough data accumulates.
+- `actual_max_c_used` — official value when available, proxy otherwise;
+  this is what `actual_bucket`/`ecmwf_hit` are actually calculated from.
+- `settlement_source` — `noaa_nws`, `hko_opendata`, or
+  `openmeteo_archive_proxy_fallback`, telling you exactly which path
+  produced `actual_max_c_used` for that row.
+
+## Dashboard: "Exclude pre-fix rows" toggle
+
+`app.py` has a sidebar checkbox that filters out rows tagged with a
+legacy `_schema_version` (`gen_a`/`gen_b`/`gen_c`/`gen_d`, or plain `1`),
+i.e. everything collected before the 2026-08 audit fixes. This does
+**not** delete or modify any file — it only changes what the current
+dashboard session displays. Turn it on for a "clean slate" view; leave
+it off to see the full historical dataset.

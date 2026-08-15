@@ -51,6 +51,30 @@ if st.sidebar.button("🔄 Force Refresh Data"):
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
+# Legacy rows (recovered from the original mixed-schema log, or the
+# pre-fix "gen_d" enhanced schema) predate the 2026-08 audit fixes:
+# lead_time_hours used UTC midnight instead of local midnight, and
+# ecmwf_bucket/gfs_bucket/market_modal_bucket didn't exist yet. They're
+# genuine historical data, not corrupted -- but if you want a "clean"
+# view using only rows collected after the fixes, use this toggle
+# rather than deleting anything from the underlying files.
+LEGACY_SCHEMA_TAGS = {"gen_a", "gen_b", "gen_c", "gen_d", "1", 1}
+exclude_legacy = st.sidebar.checkbox(
+    "Exclude pre-fix rows (legacy schema)",
+    value=False,
+    help=(
+        "Hides rows recovered from the original mixed-schema log and "
+        "the pre-audit 'gen_d' schema. Nothing is deleted -- this only "
+        "changes what this dashboard view shows."
+    ),
+)
+if exclude_legacy and "_schema_version" in df.columns:
+    before = len(df)
+    df = df[~df["_schema_version"].astype(str).isin({str(v) for v in LEGACY_SCHEMA_TAGS})]
+    st.sidebar.caption(f"Showing {len(df)} of {before} rows (post-fix schema only).")
+elif exclude_legacy:
+    st.sidebar.caption("No _schema_version column found in this data -- toggle has no effect.")
+
 all_cities = sorted(df["city"].dropna().unique())
 selected_cities = st.sidebar.multiselect(
     "Cities", options=all_cities, default=all_cities

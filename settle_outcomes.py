@@ -7,30 +7,30 @@ import pandas as pd
 import requests
 
 from data_utils import load_combined_log
+from official_settlement_sources import fetch_official_actual_max_c
 
 INPUT_CSV = "polymarket_weather_live_log.csv"
 EVALUATED_CSV = "polymarket_weather_evaluated.csv"
 
-# --- SETTLEMENT SOURCE NOTE (2026-08 audit) -----------------------------
-# Polymarket's actual resolution source for these markets is a named
-# station feed -- Wunderground (specific airport station per city, e.g.
-# Tokyo Haneda / RJTT, NYC LaGuardia) for most cities, and the Hong Kong
-# Observatory's own "Absolute Daily Max" daily extract for Hong Kong
-# specifically. It is NOT a generic reanalysis grid product.
+# --- SETTLEMENT SOURCE NOTE (2026-08 audit, updated) --------------------
+# Confirmed by reading live Polymarket market rules pages: the official
+# resolution source per city is a named station feed -- Wunderground
+# (specific airport station per city) for most cities, and the Hong Kong
+# Observatory's own daily extract for Hong Kong specifically.
 #
-# This script still uses the Open-Meteo Archive API below, because it's
-# free, reliable, and requires no station-scraping infrastructure. That
-# makes it a useful, fast PROXY for the true outcome, but it is a grid
-# reanalysis value at a lat/lon point, not the specific station reading
-# the contract settles on, and the two can genuinely diverge.
+# As of this update, REAL official sources are wired in for 4 of 14
+# cities (see official_settlement_sources.py):
+#   - New York (KLGA), Chicago (KORD), Miami (KMIA) via NOAA/NWS
+#     api.weather.gov -- the same underlying ASOS/METAR feed Wunderground
+#     displays for these airport stations.
+#   - Hong Kong via HKO's own public open data API.
 #
-# Until a real per-city station scraper (Wunderground pages / HKO daily
-# extract) is built, every value derived here is written under a
-# "_openmeteo_proxy" name and flagged in data_quality, rather than being
-# presented as the official settlement outcome. Do not treat
-# actual_max_c_openmeteo_proxy as ground truth for a live trading
-# decision -- it is intended for approximate/exploratory backtesting
-# only until the real station sources are wired in.
+# The remaining 10 cities have no verified non-Wunderground public
+# equivalent yet, and continue to use the Open-Meteo Archive reanalysis
+# proxy. Every row's `settlement_source` column says exactly which path
+# was used, and `actual_max_c_openmeteo_proxy` is ALWAYS computed
+# regardless (even for the 4 official cities) so you can cross-check the
+# proxy's accuracy against real data as it accumulates.
 CITIES = {
     "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C", "tz": "Asia/Hong_Kong"},
     "Tokyo": {"lat": 35.6762, "lon": 139.6503, "unit": "C", "tz": "Asia/Tokyo"},
@@ -149,37 +149,49 @@ def verify_and_settle():
     return
 
   unique_targets = df[["city", "target_date"]].drop_duplicates()
-  actual_results = {}
+  proxy_results = {}
+  official_results = {}
 
   print(
-      "Fetching actual historical temperatures from Open-Meteo Archive"
-      " (PROXY source -- see SETTLEMENT SOURCE NOTE at top of this file"
-      " for why this is not yet the official Wunderground/HKO value)..."
+      "Fetching actual outcomes: official source where available (NOAA/HKO),"
+      " Open-Meteo Archive proxy for every city as a cross-check/fallback..."
   )
   for _, row in unique_targets.iterrows():
     city = row["city"]
     target_date = str(row["target_date"])
 
-    if city in CITIES:
-      unit = CITIES[city]["unit"]
-      iana_tz = CITIES[city]["tz"]
-      actual_temp_c = get_actual_max_temp(
-          CITIES[city]["lat"], CITIES[city]["lon"], target_date, iana_tz
-      )
+    if city not in CITIES:
+      continue
 
-      if actual_temp_c is not None:
-        native_temp = (
-            c_to_f(actual_temp_c) if unit == "F" else actual_temp_c
-        )
-        actual_results[(city, target_date)] = (actual_temp_c, native_temp)
-        print(
-            f"  ✓ {city} on {target_date}: {actual_temp_c}°C"
-            f" ({native_temp:.1f}°{unit})"
-        )
-      else:
-        print(f"  ✗ {city} on {target_date}: Data not available yet.")
+    unit = CITIES[city]["unit"]
+    iana_tz = CITIES[city]["tz"]
 
-  if not actual_results:
+    # 1. Try the real official source first (only implemented for a
+    #    subset of cities -- see official_settlement_sources.py).
+    official_c, official_source = fetch_official_actual_max_c(city, target_date, iana_tz)
+    if official_c is not None:
+      official_results[(city, target_date)] = (official_c, official_source)
+
+    # 2. ALWAYS also compute the Open-Meteo proxy, even for cities with
+    #    an official source -- this lets you empirically check, once
+    #    enough data accumulates, how closely the proxy tracks the real
+    #    value for the cities where we can compare them directly.
+    proxy_c = get_actual_max_temp(
+        CITIES[city]["lat"], CITIES[city]["lon"], target_date, iana_tz
+    )
+    if proxy_c is not None:
+      proxy_results[(city, target_date)] = proxy_c
+
+    if official_c is not None:
+      native = c_to_f(official_c) if unit == "F" else official_c
+      print(f"  ✓ {city} on {target_date}: OFFICIAL {official_c}°C ({native:.1f}°{unit}) via {official_source}")
+    elif proxy_c is not None:
+      native = c_to_f(proxy_c) if unit == "F" else proxy_c
+      print(f"  ~ {city} on {target_date}: proxy only {proxy_c}°C ({native:.1f}°{unit})")
+    else:
+      print(f"  ✗ {city} on {target_date}: Data not available yet.")
+
+  if not official_results and not proxy_results:
     print(
         "No actual temperature data found yet (target dates likely"
         " haven't finished yet). Still writing the evaluated CSV so the"
@@ -187,23 +199,33 @@ def verify_and_settle():
         " columns will simply be empty for unresolved rows."
     )
 
-  # Map numerical actual temperatures.
-  # NOTE: renamed from actual_max_c -> actual_max_c_openmeteo_proxy to be
-  # explicit that this is a reanalysis-grid proxy for the official
-  # station-based settlement value, not the official value itself
-  # (audit CRITICAL-2).
+  def resolve_actual(r):
+    key = (r["city"], str(r["target_date"]))
+    if key in official_results:
+      val, source = official_results[key]
+      return pd.Series([val, val, source])
+    if key in proxy_results:
+      return pd.Series([None, proxy_results[key], "openmeteo_archive_proxy_fallback"])
+    return pd.Series([None, None, None])
+
+  resolved = df.apply(resolve_actual, axis=1)
+  resolved.columns = ["actual_max_c_official", "actual_max_c_used", "settlement_source"]
+  df["actual_max_c_official"] = resolved["actual_max_c_official"]
+  # NOTE: kept under its established name for continuity with earlier
+  # rows -- ALWAYS the proxy value when available, independent of
+  # whether an official value was also found (see note above).
   df["actual_max_c_openmeteo_proxy"] = df.apply(
-      lambda r: actual_results.get((r["city"], str(r["target_date"])), (None, None))[
-          0
-      ],
-      axis=1,
+      lambda r: proxy_results.get((r["city"], str(r["target_date"]))), axis=1
   )
-  df["settlement_source"] = "openmeteo_archive_proxy"
+  # The value actually used for bucket evaluation below: official when
+  # we have it, proxy as fallback otherwise.
+  df["actual_max_c_used"] = resolved["actual_max_c_used"]
+  df["settlement_source"] = resolved["settlement_source"]
 
   # Dynamic Bucket Evaluation
   def evaluate_row(row):
     city = row["city"]
-    actual_c = row["actual_max_c_openmeteo_proxy"]
+    actual_c = row["actual_max_c_used"]
     if actual_c is None or pd.isna(actual_c) or city not in CITIES:
       return None, None
 
