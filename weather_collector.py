@@ -1,10 +1,11 @@
+import csv
+from datetime import datetime, timezone
 import json
 import math
 import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -295,19 +296,21 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
 
 
 def parse_bucket_midpoint(bucket_str):
-  """Parses range buckets (e.g., '82-83°F', '30°C') into clean numerical midpoints."""
+  """Parses range buckets into numerical midpoints."""
   if not bucket_str:
     return None
 
   s = str(bucket_str).strip()
 
-  range_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", s)
+  range_match = re.search(
+      r"(-?\d+(?:\.\d+)?)\s*(?:-|to)\s*(-?\d+(?:\.\d+)?)", s
+  )
   if range_match:
     low = float(range_match.group(1))
     high = float(range_match.group(2))
     return (low + high) / 2.0
 
-  nums = re.findall(r"\d+(?:\.\d+)?", s)
+  nums = re.findall(r"-?\d+(?:\.\d+)?", s)
   if not nums:
     return None
 
@@ -322,7 +325,7 @@ def parse_bucket_midpoint(bucket_str):
 
 
 def match_temp_to_bucket(temp_native, poly_prices):
-  """Matches native unit temperature to market buckets, handling ranges, degree symbols, and boundary rounding."""
+  """Matches native unit temperature to market buckets with exact bounds."""
   if temp_native is None or not poly_prices:
     return None, None, False
 
@@ -332,17 +335,18 @@ def match_temp_to_bucket(temp_native, poly_prices):
     lbl = str(bucket_label).strip()
     lbl_lower = lbl.lower()
 
-    # 1. Direct degree match (e.g., "30°C", "84°F")
-    if f"{rounded_val}°" in lbl or f"{rounded_val} °" in lbl:
+    # 1. Exact integer degree match (e.g., "30°C", "84°F") using regex bounds
+    if re.search(r"\b" + str(rounded_val) + r"\s*°", lbl):
       return bucket_label, prob, True
 
-    # 2. Range match with rounded boundary tolerance (e.g., "82-83°F", "84-85°F")
-    range_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", lbl)
+    # 2. Range match (e.g., "82-83°F", "84-85°F")
+    range_match = re.search(
+        r"(-?\d+(?:\.\d+)?)\s*(?:-|to)\s*(-?\d+(?:\.\d+)?)", lbl
+    )
     if range_match:
       low = float(range_match.group(1))
       high = float(range_match.group(2))
 
-      # Check both float range and rounded integer range
       if (
           (low - 0.5) <= temp_native <= (high + 0.5)
       ) or low <= rounded_val <= high:
@@ -350,7 +354,7 @@ def match_temp_to_bucket(temp_native, poly_prices):
       continue
 
     # 3. Single bounded matches (e.g., "84°F or higher", "75°F or below")
-    nums = re.findall(r"\d+(?:\.\d+)?", lbl)
+    nums = re.findall(r"-?\d+(?:\.\d+)?", lbl)
     if nums:
       bound_val = float(nums[0])
       if (
@@ -366,7 +370,7 @@ def match_temp_to_bucket(temp_native, poly_prices):
 
 
 def compute_market_implied_temp(prices_dict):
-  """Calculates probability-weighted average temperature in the market's native units."""
+  """Calculates probability-weighted average temperature."""
   if not prices_dict:
     return None, 0.0
 
@@ -386,10 +390,11 @@ def compute_market_implied_temp(prices_dict):
 
 
 def load_previous_snapshot():
+  """Loads snapshot with on_bad_lines='skip' to ensure broken historical rows don't crash execution."""
   if not os.path.exists(CSV_FILE):
     return {}
   try:
-    df = pd.read_csv(CSV_FILE)
+    df = pd.read_csv(CSV_FILE, engine="python", on_bad_lines="skip")
     if df.empty or "city" not in df.columns:
       return {}
     last_records = {}
@@ -558,12 +563,16 @@ def log_snapshot():
   if records:
     df = pd.DataFrame(records, columns=CSV_COLUMNS)
     file_exists = os.path.exists(CSV_FILE)
+
+    # STRICT CSV EXPORT FIX: Enforce quote minimalism & escape characters
     df.to_csv(
         CSV_FILE,
         mode="a",
         header=not file_exists,
         index=False,
         encoding="utf-8-sig",
+        quoting=csv.QUOTE_MINIMAL,
+        escapechar="\\",
     )
     print(
         f"[{now_utc_str}] Logged snapshot '{snapshot_id}' for {len(records)}"
