@@ -28,7 +28,11 @@ CITIES = {
 
 
 def c_to_f(c_temp):
-  return (c_temp * 9 / 5) + 32 if c_temp is not None else None
+  return (
+      (c_temp * 9 / 5) + 32
+      if c_temp is not None and pd.notnull(c_temp)
+      else None
+  )
 
 
 def get_actual_max_temp(lat, lon, target_date_str):
@@ -38,7 +42,7 @@ def get_actual_max_temp(lat, lon, target_date_str):
       f"&daily=temperature_2m_max&timezone=UTC"
   )
   try:
-    res = requests.get(url, timeout=10)
+    res = requests.get(url, timeout=15)
     if res.status_code == 200:
       data = res.json()
       temps = data.get("daily", {}).get("temperature_2m_max", [])
@@ -51,7 +55,8 @@ def get_actual_max_temp(lat, lon, target_date_str):
 
 def match_observed_to_bucket(temp_native, poly_prices):
   """Matches observed temperature to actual market range buckets dynamically."""
-  if temp_native is None or not poly_prices:
+  # Safely exit if temp is None or NaN
+  if temp_native is None or pd.isna(temp_native) or not poly_prices:
     return None
 
   rounded_val = int(round(temp_native))
@@ -152,13 +157,12 @@ def verify_and_settle():
   def evaluate_row(row):
     city = row["city"]
     actual_c = row["actual_max_c"]
-    if actual_c is None or city not in CITIES:
+    if actual_c is None or pd.isna(actual_c) or city not in CITIES:
       return None, False
 
     unit = CITIES[city]["unit"]
     native_temp = c_to_f(actual_c) if unit == "F" else actual_c
 
-    # Safely load json prices to match winning bucket label
     poly_prices = {}
     if pd.notnull(row["all_bucket_prices"]):
       try:
@@ -167,7 +171,11 @@ def verify_and_settle():
         pass
 
     winning_bucket = match_observed_to_bucket(native_temp, poly_prices)
-    hit = str(row["predicted_bucket"]).strip() == str(winning_bucket).strip()
+    hit = (
+        str(row["predicted_bucket"]).strip() == str(winning_bucket).strip()
+        if winning_bucket is not None
+        else False
+    )
     return winning_bucket, hit
 
   eval_res = df.apply(evaluate_row, axis=1)
