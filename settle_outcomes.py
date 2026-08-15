@@ -6,24 +6,46 @@ import re
 import pandas as pd
 import requests
 
+from data_utils import load_combined_log
+
 INPUT_CSV = "polymarket_weather_live_log.csv"
 EVALUATED_CSV = "polymarket_weather_evaluated.csv"
 
+# --- SETTLEMENT SOURCE NOTE (2026-08 audit) -----------------------------
+# Polymarket's actual resolution source for these markets is a named
+# station feed -- Wunderground (specific airport station per city, e.g.
+# Tokyo Haneda / RJTT, NYC LaGuardia) for most cities, and the Hong Kong
+# Observatory's own "Absolute Daily Max" daily extract for Hong Kong
+# specifically. It is NOT a generic reanalysis grid product.
+#
+# This script still uses the Open-Meteo Archive API below, because it's
+# free, reliable, and requires no station-scraping infrastructure. That
+# makes it a useful, fast PROXY for the true outcome, but it is a grid
+# reanalysis value at a lat/lon point, not the specific station reading
+# the contract settles on, and the two can genuinely diverge.
+#
+# Until a real per-city station scraper (Wunderground pages / HKO daily
+# extract) is built, every value derived here is written under a
+# "_openmeteo_proxy" name and flagged in data_quality, rather than being
+# presented as the official settlement outcome. Do not treat
+# actual_max_c_openmeteo_proxy as ground truth for a live trading
+# decision -- it is intended for approximate/exploratory backtesting
+# only until the real station sources are wired in.
 CITIES = {
-    "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C"},
-    "Tokyo": {"lat": 35.6762, "lon": 139.6503, "unit": "C"},
-    "Shanghai": {"lat": 31.2304, "lon": 121.4737, "unit": "C"},
-    "Qingdao": {"lat": 36.0671, "lon": 120.3826, "unit": "C"},
-    "Seoul": {"lat": 37.5665, "lon": 126.9780, "unit": "C"},
-    "Guangzhou": {"lat": 23.1291, "lon": 113.2644, "unit": "C"},
-    "Shenzhen": {"lat": 22.5431, "lon": 114.0579, "unit": "C"},
-    "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F"},
-    "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F"},
-    "Miami": {"lat": 25.7617, "lon": -80.1918, "unit": "F"},
-    "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C"},
-    "Paris": {"lat": 48.8566, "lon": 2.3522, "unit": "C"},
-    "Ankara": {"lat": 39.9334, "lon": 32.8597, "unit": "C"},
-    "Buenos Aires": {"lat": -34.6037, "lon": -58.3816, "unit": "C"},
+    "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C", "tz": "Asia/Hong_Kong"},
+    "Tokyo": {"lat": 35.6762, "lon": 139.6503, "unit": "C", "tz": "Asia/Tokyo"},
+    "Shanghai": {"lat": 31.2304, "lon": 121.4737, "unit": "C", "tz": "Asia/Shanghai"},
+    "Qingdao": {"lat": 36.0671, "lon": 120.3826, "unit": "C", "tz": "Asia/Shanghai"},
+    "Seoul": {"lat": 37.5665, "lon": 126.9780, "unit": "C", "tz": "Asia/Seoul"},
+    "Guangzhou": {"lat": 23.1291, "lon": 113.2644, "unit": "C", "tz": "Asia/Shanghai"},
+    "Shenzhen": {"lat": 22.5431, "lon": 114.0579, "unit": "C", "tz": "Asia/Shanghai"},
+    "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F", "tz": "America/New_York"},
+    "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F", "tz": "America/Chicago"},
+    "Miami": {"lat": 25.7617, "lon": -80.1918, "unit": "F", "tz": "America/New_York"},
+    "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C", "tz": "Europe/London"},
+    "Paris": {"lat": 48.8566, "lon": 2.3522, "unit": "C", "tz": "Europe/Paris"},
+    "Ankara": {"lat": 39.9334, "lon": 32.8597, "unit": "C", "tz": "Europe/Istanbul"},
+    "Buenos Aires": {"lat": -34.6037, "lon": -58.3816, "unit": "C", "tz": "America/Argentina/Buenos_Aires"},
 }
 
 
@@ -35,11 +57,17 @@ def c_to_f(c_temp):
   )
 
 
-def get_actual_max_temp(lat, lon, target_date_str):
+def get_actual_max_temp(lat, lon, target_date_str, iana_tz):
+  # FIX (audit CRITICAL-3): aggregate the daily max over the city's
+  # LOCAL calendar day, not the UTC calendar day. target_date_str is a
+  # local date (matching the Polymarket market's named date); passing
+  # timezone=UTC here previously shifted the day boundary by the city's
+  # UTC offset (e.g. 9h for Tokyo), pulling in the wrong slice of
+  # observations for non-UTC cities.
   url = (
       f"https://archive-api.open-meteo.com/v1/archive?"
       f"latitude={lat}&longitude={lon}&start_date={target_date_str}&end_date={target_date_str}"
-      f"&daily=temperature_2m_max&timezone=UTC"
+      f"&daily=temperature_2m_max&timezone={iana_tz}"
   )
   try:
     res = requests.get(url, timeout=15)
@@ -95,7 +123,12 @@ def match_observed_to_bucket(temp_native, poly_prices):
       ) and temp_native <= (bound_val + 0.5):
         return bucket_label
 
-  return f"{rounded_val}°"
+  # FIX (audit MEDIUM): previously fabricated a pseudo-label like "27°"
+  # here even when no real market bucket matched, which could get
+  # silently compared against predicted_bucket as if it were a genuine
+  # miss. Return None instead so the caller can flag this as an
+  # unresolved mapping rather than a false "wrong prediction".
+  return None
 
 
 def verify_and_settle():
@@ -104,9 +137,9 @@ def verify_and_settle():
     return
 
   try:
-    df = pd.read_csv(
-        INPUT_CSV, engine="python", on_bad_lines="skip", quoting=csv.QUOTE_MINIMAL
-    )
+    # Reads ALL schema versions of the raw log (v1 + any _v2, _v3, ...)
+    # and unions them, rather than only the original un-suffixed file.
+    df = load_combined_log(INPUT_CSV)
   except Exception as e:
     print(f"Critical error loading CSV: {e}")
     return
@@ -118,15 +151,20 @@ def verify_and_settle():
   unique_targets = df[["city", "target_date"]].drop_duplicates()
   actual_results = {}
 
-  print("Fetching actual historical temperatures from Open-Meteo Archive...")
+  print(
+      "Fetching actual historical temperatures from Open-Meteo Archive"
+      " (PROXY source -- see SETTLEMENT SOURCE NOTE at top of this file"
+      " for why this is not yet the official Wunderground/HKO value)..."
+  )
   for _, row in unique_targets.iterrows():
     city = row["city"]
     target_date = str(row["target_date"])
 
     if city in CITIES:
       unit = CITIES[city]["unit"]
+      iana_tz = CITIES[city]["tz"]
       actual_temp_c = get_actual_max_temp(
-          CITIES[city]["lat"], CITIES[city]["lon"], target_date
+          CITIES[city]["lat"], CITIES[city]["lon"], target_date, iana_tz
       )
 
       if actual_temp_c is not None:
@@ -145,36 +183,49 @@ def verify_and_settle():
     print("No actual temperature data found yet. Try again tomorrow.")
     return
 
-  # Map numerical actual temperatures
-  df["actual_max_c"] = df.apply(
+  # Map numerical actual temperatures.
+  # NOTE: renamed from actual_max_c -> actual_max_c_openmeteo_proxy to be
+  # explicit that this is a reanalysis-grid proxy for the official
+  # station-based settlement value, not the official value itself
+  # (audit CRITICAL-2).
+  df["actual_max_c_openmeteo_proxy"] = df.apply(
       lambda r: actual_results.get((r["city"], str(r["target_date"])), (None, None))[
           0
       ],
       axis=1,
   )
+  df["settlement_source"] = "openmeteo_archive_proxy"
 
   # Dynamic Bucket Evaluation
   def evaluate_row(row):
     city = row["city"]
-    actual_c = row["actual_max_c"]
+    actual_c = row["actual_max_c_openmeteo_proxy"]
     if actual_c is None or pd.isna(actual_c) or city not in CITIES:
-      return None, False
+      return None, None
 
     unit = CITIES[city]["unit"]
     native_temp = c_to_f(actual_c) if unit == "F" else actual_c
 
     poly_prices = {}
-    if pd.notnull(row["all_bucket_prices"]):
+    if pd.notnull(row.get("all_bucket_prices")):
       try:
         poly_prices = json.loads(row["all_bucket_prices"])
       except Exception:
         pass
 
     winning_bucket = match_observed_to_bucket(native_temp, poly_prices)
+    if winning_bucket is None:
+      # FIX (audit MEDIUM): an unresolved bucket mapping is UNKNOWN, not
+      # a miss. Previously this fell through to hit=False, which is
+      # indistinguishable from "ECMWF genuinely predicted the wrong
+      # bucket" in later analysis.
+      return None, None
+
+    predicted = row.get("predicted_bucket")
     hit = (
-        str(row["predicted_bucket"]).strip() == str(winning_bucket).strip()
-        if winning_bucket is not None
-        else False
+        str(predicted).strip() == str(winning_bucket).strip()
+        if pd.notnull(predicted)
+        else None
     )
     return winning_bucket, hit
 

@@ -11,6 +11,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
+from data_utils import compute_lead_time_hours, load_combined_log, resolve_write_target
+
 # 1. CITIES CONFIGURATION
 CITIES = {
     "Hong Kong": {
@@ -129,14 +131,42 @@ CITIES = {
 
 CSV_FILE = "polymarket_weather_live_log.csv"
 
+# --- SCHEMA NOTE (2026-08 audit) ---------------------------------------
+# `predicted_bucket` / `polymarket_price` are PRESERVED with their
+# original (as-implemented) historical meaning for continuity with every
+# already-logged row: they are the Polymarket bucket that matches the
+# ECMWF forecast, and that bucket's market price. They are NOT the
+# market's modal (highest-probability) bucket, despite the name.
+# Renaming or repurposing them here would silently break every existing
+# row's interpretation with no way to tell old vs. new meaning apart.
+#
+# Instead, this schema version ADDS clearly-named columns that were
+# missing before:
+#   - ecmwf_bucket / ecmwf_bucket_probability : explicit, unambiguous
+#     duplicate of predicted_bucket / polymarket_price under an honest
+#     name. (ecmwf_bucket_probability already existed; ecmwf_bucket did
+#     not and is new.)
+#   - gfs_bucket / gfs_bucket_probability : the GFS-forecast-matched
+#     bucket and its price. gfs_bucket is new; gfs_bucket_probability
+#     already existed but previously had no accompanying label.
+#   - market_modal_bucket / market_modal_bucket_price : the market's
+#     actual current favorite (highest-priced) bucket -- this is what
+#     "predicted_bucket" was originally *intended* to mean, now
+#     implemented correctly under its own name.
+#
+# Because this column set differs from the original file's header,
+# these rows are written to a NEW physical file
+# (polymarket_weather_live_log_v2.csv) rather than appended under the
+# old header. See data_utils.resolve_write_target /
+# data_utils.load_combined_log.
 CSV_COLUMNS = [
     "timestamp_utc",
     "city",
     "target_date",
     "ecmwf_max_c",
     "gfs_max_c",
-    "predicted_bucket",
-    "polymarket_price",
+    "predicted_bucket",  # legacy meaning preserved: == ecmwf_bucket
+    "polymarket_price",  # legacy meaning preserved: == ecmwf_bucket_probability
     "all_bucket_prices",
     "snapshot_id",
     "lead_time_hours",
@@ -145,10 +175,15 @@ CSV_COLUMNS = [
     "ecmwf_run_utc",
     "gfs_run_utc",
     "market_implied_temp_c",
+    "market_implied_temp_used_open_bucket_approx",
     "market_vs_ecmwf_c",
     "market_vs_gfs_c",
+    "ecmwf_bucket",
     "ecmwf_bucket_probability",
+    "gfs_bucket",
     "gfs_bucket_probability",
+    "market_modal_bucket",
+    "market_modal_bucket_price",
     "ecmwf_change_c",
     "gfs_change_c",
     "market_implied_change_c",
@@ -296,9 +331,16 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
 
 
 def parse_bucket_midpoint(bucket_str):
-  """Parses range buckets into numerical midpoints."""
+  """Parses range buckets into numerical midpoints.
+
+  Returns (midpoint, is_open_ended_approx). Open-ended buckets ("35°C or
+  higher", "25°C or lower") have no true midpoint -- the +/-0.5 used
+  here is a documented APPROXIMATION, not a value derived from the
+  actual contract, and callers should propagate the flag rather than
+  silently trusting it as exact.
+  """
   if not bucket_str:
-    return None
+    return None, False
 
   s = str(bucket_str).strip()
 
@@ -308,20 +350,20 @@ def parse_bucket_midpoint(bucket_str):
   if range_match:
     low = float(range_match.group(1))
     high = float(range_match.group(2))
-    return (low + high) / 2.0
+    return (low + high) / 2.0, False
 
   nums = re.findall(r"-?\d+(?:\.\d+)?", s)
   if not nums:
-    return None
+    return None, False
 
   val = float(nums[0])
   s_lower = s.lower()
   if "lower" in s_lower or "below" in s_lower or "under" in s_lower:
-    return val - 0.5
+    return val - 0.5, True
   if "higher" in s_lower or "above" in s_lower or "over" in s_lower:
-    return val + 0.5
+    return val + 0.5, True
 
-  return val
+  return val, False
 
 
 def match_temp_to_bucket(temp_native, poly_prices):
@@ -370,33 +412,48 @@ def match_temp_to_bucket(temp_native, poly_prices):
 
 
 def compute_market_implied_temp(prices_dict):
-  """Calculates probability-weighted average temperature."""
+  """Calculates probability-weighted average temperature.
+
+  Returns (implied_temp, total_prob, used_open_bucket_approx). The third
+  value is True if any bucket that contributed non-trivial weight was an
+  open-ended bucket ("X or higher/lower"), whose midpoint is a
+  documented approximation rather than a value defined by the contract.
+  """
   if not prices_dict:
-    return None, 0.0
+    return None, 0.0, False
 
   total_weighted = 0.0
   total_prob = 0.0
+  used_approx = False
 
   for bucket_label, prob in prices_dict.items():
     if prob is not None and prob > 0:
-      midpoint = parse_bucket_midpoint(bucket_label)
+      midpoint, is_approx = parse_bucket_midpoint(bucket_label)
       if midpoint is not None:
         total_weighted += midpoint * prob
         total_prob += prob
+        if is_approx:
+          used_approx = True
 
   if total_prob > 0:
-    return round(total_weighted / total_prob, 2), round(total_prob, 4)
-  return None, 0.0
+    return round(total_weighted / total_prob, 2), round(total_prob, 4), used_approx
+  return None, 0.0, False
 
 
 def load_previous_snapshot():
-  """Loads snapshot with on_bad_lines='skip' to ensure broken historical rows don't crash execution."""
-  if not os.path.exists(CSV_FILE):
-    return {}
+  """Loads the most recent row per city across ALL schema versions of
+  the log (see data_utils.load_combined_log), so 'previous observation'
+  comparisons (ecmwf_change_c etc.) aren't blind to rows written under
+  an older or newer schema file.
+  """
   try:
-    df = pd.read_csv(CSV_FILE, engine="python", on_bad_lines="skip")
+    df = load_combined_log(CSV_FILE)
     if df.empty or "city" not in df.columns:
       return {}
+    # Sort by timestamp so "last" is chronologically last, not just
+    # last-in-file (matters once multiple schema-version files exist).
+    if "timestamp_utc" in df.columns:
+      df = df.sort_values("timestamp_utc")
     last_records = {}
     for city, group in df.groupby("city"):
       last_row = group.iloc[-1]
@@ -450,15 +507,9 @@ def log_snapshot():
     if not poly_prices:
       quality_issues.append("MISSING_POLYMARKET_PRICES")
 
-    # 3. Lead Time Calculation
-    lead_time_hours = None
-    if target_date:
-      target_midnight_utc = datetime.strptime(
-          target_date, "%Y-%m-%d"
-      ).replace(tzinfo=timezone.utc)
-      lead_time_hours = round(
-          (target_midnight_utc - now_dt).total_seconds() / 3600.0, 2
-      )
+    # 3. Lead Time Calculation (city-LOCAL midnight, not UTC midnight --
+    # see data_utils.compute_lead_time_hours / audit finding HIGH-1)
+    lead_time_hours = compute_lead_time_hours(now_dt, target_date, info["tz"])
 
     # 4. Spreads & Bucket Matching
     model_spread_c = None
@@ -479,11 +530,27 @@ def log_snapshot():
     if gfs_t_c is not None and poly_prices and not gfs_valid:
       quality_issues.append("GFS_BUCKET_MAPPING_AMBIGUOUS")
 
+    # NOTE (schema v2): predicted_bucket/polymarket_price keep their
+    # ORIGINAL as-implemented meaning (ECMWF-matched bucket) for
+    # continuity with every historical row. See CSV_COLUMNS comment.
     predicted_bucket = ecmwf_bucket
     polymarket_price = ecmwf_bucket_prob
 
+    # market_modal_bucket: the market's ACTUAL current favorite bucket
+    # (highest priced), independent of either model. This is what
+    # "predicted_bucket" was originally intended to mean; it now has
+    # its own honestly-named field instead of overloading an existing
+    # column.
+    market_modal_bucket = None
+    market_modal_bucket_price = None
+    if poly_prices:
+      market_modal_bucket = max(poly_prices, key=poly_prices.get)
+      market_modal_bucket_price = poly_prices[market_modal_bucket]
+
     # 5. Market Implied Temperature (Standardized to °C for CSV)
-    mkt_implied_native, sum_prob = compute_market_implied_temp(poly_prices)
+    mkt_implied_native, sum_prob, implied_used_approx = (
+        compute_market_implied_temp(poly_prices)
+    )
     mkt_implied_c = (
         f_to_c(mkt_implied_native)
         if (unit == "F" and mkt_implied_native is not None)
@@ -530,6 +597,11 @@ def log_snapshot():
         else None
     )
 
+    if implied_used_approx:
+      quality_issues.append("IMPLIED_TEMP_USED_OPEN_BUCKET_APPROX")
+    if poly_prices and market_modal_bucket is None:
+      quality_issues.append("MODAL_BUCKET_UNRESOLVED")
+
     # 7. Construct Record
     all_bucket_json = json.dumps(poly_prices, ensure_ascii=False)
     data_quality = "OK" if not quality_issues else "|".join(quality_issues)
@@ -540,8 +612,8 @@ def log_snapshot():
         "target_date": target_date,
         "ecmwf_max_c": ecmwf_t_c,
         "gfs_max_c": gfs_t_c,
-        "predicted_bucket": predicted_bucket,
-        "polymarket_price": polymarket_price,
+        "predicted_bucket": predicted_bucket,  # legacy meaning: == ecmwf_bucket
+        "polymarket_price": polymarket_price,  # legacy meaning: == ecmwf_bucket_probability
         "all_bucket_prices": all_bucket_json,
         "snapshot_id": snapshot_id,
         "lead_time_hours": lead_time_hours,
@@ -550,10 +622,15 @@ def log_snapshot():
         "ecmwf_run_utc": None,
         "gfs_run_utc": None,
         "market_implied_temp_c": mkt_implied_c,
+        "market_implied_temp_used_open_bucket_approx": implied_used_approx,
         "market_vs_ecmwf_c": mkt_vs_ecmwf,
         "market_vs_gfs_c": mkt_vs_gfs,
+        "ecmwf_bucket": ecmwf_bucket,
         "ecmwf_bucket_probability": ecmwf_bucket_prob,
+        "gfs_bucket": gfs_bucket,
         "gfs_bucket_probability": gfs_bucket_prob,
+        "market_modal_bucket": market_modal_bucket,
+        "market_modal_bucket_price": market_modal_bucket_price,
         "ecmwf_change_c": ecmwf_change,
         "gfs_change_c": gfs_change,
         "market_implied_change_c": mkt_change,
@@ -562,18 +639,29 @@ def log_snapshot():
 
   if records:
     df = pd.DataFrame(records, columns=CSV_COLUMNS)
-    file_exists = os.path.exists(CSV_FILE)
+
+    # Schema-safe write: if the column set differs from whatever file
+    # currently holds the latest schema version, this routes to a NEW
+    # file (e.g. polymarket_weather_live_log_v2.csv) instead of
+    # appending mismatched columns under a stale header. Historical
+    # files are never touched. See data_utils.resolve_write_target.
+    write_path, need_header = resolve_write_target(CSV_FILE, CSV_COLUMNS)
 
     # STRICT CSV EXPORT FIX: Enforce quote minimalism & escape characters
     df.to_csv(
-        CSV_FILE,
+        write_path,
         mode="a",
-        header=not file_exists,
+        header=need_header,
         index=False,
         encoding="utf-8-sig",
         quoting=csv.QUOTE_MINIMAL,
         escapechar="\\",
     )
+    if write_path != CSV_FILE:
+      print(
+          f"[{now_utc_str}] Schema change detected -- new rows written to"
+          f" '{write_path}' (old file '{CSV_FILE}' left untouched)."
+      )
     print(
         f"[{now_utc_str}] Logged snapshot '{snapshot_id}' for {len(records)}"
         " cities."
