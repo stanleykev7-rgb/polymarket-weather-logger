@@ -4,33 +4,117 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# 1. CITIES LIST (14 Cities fully configured)
+# 1. CITIES CONFIGURATION (Configured with dynamic slug tags & search overrides)
 CITIES = {
-    "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "slug": "hong-kong"},
-    "Tokyo": {"lat": 35.6762, "lon": 139.6503, "slug": "tokyo"},
-    "Shanghai": {"lat": 31.2304, "lon": 121.4737, "slug": "shanghai"},
-    "Qingdao": {"lat": 36.0671, "lon": 120.3826, "slug": "qingdao"},
-    "Seoul": {"lat": 37.5665, "lon": 126.9780, "slug": "seoul"},
-    "Guangzhou": {"lat": 23.1291, "lon": 113.2644, "slug": "guangzhou"},
-    "Shenzhen": {"lat": 22.5431, "lon": 114.0579, "slug": "shenzhen"},
-    "New York": {"lat": 40.7128, "lon": -74.0060, "slug": "new-york"},
-    "Chicago": {"lat": 41.8781, "lon": -87.6298, "slug": "chicago"},
-    "Miami": {"lat": 25.7617, "lon": -80.1918, "slug": "miami"},
-    "London": {"lat": 51.5074, "lon": -0.1278, "slug": "london"},
-    "Paris": {"lat": 48.8566, "lon": 2.3522, "slug": "paris"},
-    "Ankara": {"lat": 39.9334, "lon": 32.8597, "slug": "ankara"},
-    "Buenos Aires": {"lat": -34.6037, "lon": -58.3816, "slug": "buenos-aires"},
+    "Hong Kong": {
+        "lat": 22.3193,
+        "lon": 114.1694,
+        "tz": "Asia/Hong_Kong",
+        "slug_tag": "hong-kong",
+        "search_term": "Highest temperature in Hong Kong",
+    },
+    "Tokyo": {
+        "lat": 35.6762,
+        "lon": 139.6503,
+        "tz": "Asia/Tokyo",
+        "slug_tag": "tokyo",
+        "search_term": "Highest temperature in Tokyo",
+    },
+    "Shanghai": {
+        "lat": 31.2304,
+        "lon": 121.4737,
+        "tz": "Asia/Shanghai",
+        "slug_tag": "shanghai",
+        "search_term": "Highest temperature in Shanghai",
+    },
+    "Qingdao": {
+        "lat": 36.0671,
+        "lon": 120.3826,
+        "tz": "Asia/Shanghai",
+        "slug_tag": "qingdao",
+        "search_term": "Highest temperature in Qingdao",
+    },
+    "Seoul": {
+        "lat": 37.5665,
+        "lon": 126.9780,
+        "tz": "Asia/Seoul",
+        "slug_tag": "seoul",
+        "search_term": "Highest temperature in Seoul",
+    },
+    "Guangzhou": {
+        "lat": 23.1291,
+        "lon": 113.2644,
+        "tz": "Asia/Shanghai",
+        "slug_tag": "guangzhou",
+        "search_term": "Highest temperature in Guangzhou",
+    },
+    "Shenzhen": {
+        "lat": 22.5431,
+        "lon": 114.0579,
+        "tz": "Asia/Shanghai",
+        "slug_tag": "shenzhen",
+        "search_term": "Highest temperature in Shenzhen",
+    },
+    "New York": {
+        "lat": 40.7128,
+        "lon": -74.0060,
+        "tz": "America/New_York",
+        "slug_tag": "nyc",
+        "search_term": "Highest temperature in NYC",
+    },
+    "Chicago": {
+        "lat": 41.8781,
+        "lon": -87.6298,
+        "tz": "America/Chicago",
+        "slug_tag": "chicago",
+        "search_term": "Highest temperature in Chicago",
+    },
+    "Miami": {
+        "lat": 25.7617,
+        "lon": -80.1918,
+        "tz": "America/New_York",
+        "slug_tag": "miami",
+        "search_term": "Highest temperature in Miami",
+    },
+    "London": {
+        "lat": 51.5074,
+        "lon": -0.1278,
+        "tz": "Europe/London",
+        "slug_tag": "london",
+        "search_term": "Highest temperature in London",
+    },
+    "Paris": {
+        "lat": 48.8566,
+        "lon": 2.3522,
+        "tz": "Europe/Paris",
+        "slug_tag": "paris",
+        "search_term": "Highest temperature in Paris",
+    },
+    "Ankara": {
+        "lat": 39.9334,
+        "lon": 32.8597,
+        "tz": "Europe/Istanbul",
+        "slug_tag": "ankara",
+        "search_term": "Highest temperature in Ankara",
+    },
+    "Buenos Aires": {
+        "lat": -34.6037,
+        "lon": -58.3816,
+        "tz": "America/Argentina/Buenos_Aires",
+        "slug_tag": "buenos-aires",
+        "search_term": "Highest temperature in Buenos Aires",
+    },
 }
 
 CSV_FILE = "polymarket_weather_live_log.csv"
 
-# 2. FINAL STRICT SCHEMA ORDERING
+# SCHEMA ORDERING
 CSV_COLUMNS = [
     "timestamp_utc",
     "city",
@@ -73,11 +157,11 @@ def create_resilient_session(retries=3, backoff_factor=1):
   return session
 
 
-def get_weather_forecast(lat, lon, max_retries=3):
-  """Fetches ECMWF/GFS daily maximum predictions with automatic retries and exponential backoff."""
+def get_weather_forecast(lat, lon, tz, max_retries=3):
+  """Fetches ECMWF/GFS daily maximum predictions strictly for the city's LOCAL calendar day."""
   url = (
       f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone=UTC"
+      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone={tz}"
   )
   session = create_resilient_session(retries=max_retries)
 
@@ -87,10 +171,14 @@ def get_weather_forecast(lat, lon, max_retries=3):
       if res.status_code == 200:
         data = res.json()
         if "daily" in data and "time" in data["daily"]:
-          target_date = data["daily"]["time"][1]
-          ecmwf_max = data["daily"]["temperature_2m_max_ecmwf_ifs025"][1]
-          gfs_max = data["daily"]["temperature_2m_max_gfs_seamless"][1]
-          return target_date, ecmwf_max, gfs_max
+          # Convert daily array into a date-indexed dict
+          forecasts = {}
+          for idx, date_str in enumerate(data["daily"]["time"]):
+            forecasts[date_str] = {
+                "ecmwf": data["daily"]["temperature_2m_max_ecmwf_ifs025"][idx],
+                "gfs": data["daily"]["temperature_2m_max_gfs_seamless"][idx],
+            }
+          return forecasts
 
       time.sleep(attempt * 1.5)
     except (requests.RequestException, KeyError, IndexError) as e:
@@ -128,54 +216,77 @@ def parse_event_markets(event_data):
   return bucket_prices
 
 
-def get_polymarket_prices(city_name, city_slug, target_date_str):
-  """Fetches active Polymarket prices using resilient session."""
+def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
+  """Checks live Polymarket events against candidate local dates (e.g.
+
+  today / tomorrow).
+  """
   session = create_resilient_session()
-  dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-  month_name = dt.strftime("%B").lower()
+  slug_tag = city_info["slug_tag"]
 
-  event_slug = (
-      f"highest-temperature-in-{city_slug}-on-{month_name}-{dt.day}-{dt.year}"
-  )
-  url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
+  # Check forecast dates in order (e.g., today's local date, then tomorrow's local date)
+  for target_date_str in forecast_dates:
+    dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    month_name = dt.strftime("%B").lower()
+    day_num = dt.day
 
-  try:
-    res = session.get(url_slug, timeout=10)
-    if res.status_code == 200:
-      prices = parse_event_markets(res.json())
-      if prices:
-        return prices
-  except Exception:
-    pass
+    # Strategy 1: Dynamic Slug Generation
+    patterns = [
+        f"highest-temperature-in-{slug_tag}-on-{month_name}-{day_num}",
+        f"highest-temperature-in-{slug_tag}-on-{month_name}-{day_num}-{dt.year}",
+    ]
 
-  # Search Fallback
-  url_search = "https://gamma-api.polymarket.com/events"
-  try:
-    res = session.get(
-        url_search,
-        params={"active": "true", "closed": "false", "q": city_name},
-        timeout=10,
-    )
-    if res.status_code == 200:
-      events = res.json()
-      if isinstance(events, list):
-        for event in events:
-          title = event.get("title", "").lower()
-          desc = event.get("description", "").lower()
-          if "highest temperature" in title and (
-              target_date_str in title or target_date_str in desc
-          ):
+    for event_slug in patterns:
+      url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
+      try:
+        res = session.get(url_slug, timeout=10)
+        if res.status_code == 200:
+          event = res.json()
+          if event and not event.get("closed", False):
             prices = parse_event_markets(event)
             if prices:
-              return prices
-  except Exception:
-    pass
+              return target_date_str, prices
+      except Exception:
+        pass
 
-  return {}
+    # Strategy 2: Flexible API Search Fallback
+    search_query = city_info.get(
+        "search_term", f"Highest temperature in {city_name}"
+    )
+    url_search = "https://gamma-api.polymarket.com/events"
+    try:
+      res = session.get(
+          url_search,
+          params={"active": "true", "closed": "false", "q": search_query},
+          timeout=10,
+      )
+      if res.status_code == 200:
+        events = res.json()
+        if isinstance(events, list):
+          for event in events:
+            title = event.get("title", "").lower()
+
+            # Check if this active market title corresponds to the target date
+            if (
+                "temperature" in title
+                and month_name in title
+                and str(day_num) in title
+            ):
+              prices = parse_event_markets(event)
+              if prices:
+                return target_date_str, prices
+    except Exception:
+      pass
+
+  # Default fallback if no active date market is found
+  default_target = (
+      forecast_dates[1] if len(forecast_dates) > 1 else forecast_dates[0]
+  )
+  return default_target, {}
 
 
 def match_temp_to_bucket(temp_c, poly_prices):
-  """Maps a decimal temperature to the explicit Polymarket bucket contract without blind assumptions."""
+  """Maps a decimal temperature to the explicit Polymarket bucket contract."""
   if temp_c is None or not poly_prices:
     return None, None, False
 
@@ -191,9 +302,13 @@ def match_temp_to_bucket(temp_c, poly_prices):
 
     if numbers:
       bound_val = float(numbers[0])
-      if ("higher" in label_lower or "above" in label_lower) and temp_c >= bound_val:
+      if (
+          "higher" in label_lower or "above" in label_lower
+      ) and temp_c >= bound_val:
         return bucket_label, prob, True
-      if ("lower" in label_lower or "below" in label_lower) and temp_c <= bound_val:
+      if (
+          "lower" in label_lower or "below" in label_lower
+      ) and temp_c <= bound_val:
         return bucket_label, prob, True
 
   return None, None, False
@@ -262,24 +377,29 @@ def log_snapshot():
   records = []
 
   for city_name, info in CITIES.items():
-    time.sleep(0.5)  # Pace requests to respect API rate limits
+    time.sleep(0.3)
     quality_issues = []
 
-    # 1. Fetch Weather
+    # 1. Fetch Local Weather Forecasts
     try:
-      target_date, ecmwf_t, gfs_t = get_weather_forecast(
-          info["lat"], info["lon"]
+      forecasts_by_date = get_weather_forecast(
+          info["lat"], info["lon"], info["tz"]
       )
+      candidate_dates = sorted(list(forecasts_by_date.keys()))[:3]
     except Exception:
-      target_date, ecmwf_t, gfs_t = None, None, None
+      forecasts_by_date = {}
+      candidate_dates = [now_dt.strftime("%Y-%m-%d")]
       quality_issues.append("WEATHER_FETCH_FAILED")
 
-    # 2. Fetch Polymarket Prices
-    poly_prices = (
-        get_polymarket_prices(city_name, info["slug"], target_date)
-        if target_date
-        else {}
+    # 2. Match Active Polymarket Event across candidate local dates
+    target_date, poly_prices = get_polymarket_prices_multi_date(
+        city_name, info, candidate_dates
     )
+
+    day_weather = forecasts_by_date.get(target_date, {})
+    ecmwf_t = day_weather.get("ecmwf")
+    gfs_t = day_weather.get("gfs")
+
     if not poly_prices:
       quality_issues.append("MISSING_POLYMARKET_PRICES")
 
