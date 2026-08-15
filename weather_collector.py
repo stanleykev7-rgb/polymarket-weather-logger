@@ -10,7 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# 1. CITIES CONFIGURATION (Added 'unit' flag to handle US Fahrenheit contracts)
+# 1. CITIES CONFIGURATION
 CITIES = {
     "Hong Kong": {
         "lat": 22.3193,
@@ -295,46 +295,63 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
 
 
 def parse_bucket_midpoint(bucket_str):
-  """Parses range buckets like '82-83°F' or single degree buckets like '30°C' cleanly into numerical midpoints."""
-  numbers = [float(n) for n in re.findall(r"-?\d+", str(bucket_str))]
-  if not numbers:
+  """Parses range buckets (e.g., '82-83°F', '30°C') into clean numerical midpoints."""
+  if not bucket_str:
     return None
 
-  if len(numbers) >= 2 and "-" in bucket_str:
-    return (numbers[0] + numbers[1]) / 2.0
+  s = str(bucket_str).strip()
 
-  val = numbers[0]
-  if "lower" in bucket_str.lower() or "below" in bucket_str.lower():
+  range_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", s)
+  if range_match:
+    low = float(range_match.group(1))
+    high = float(range_match.group(2))
+    return (low + high) / 2.0
+
+  nums = re.findall(r"\d+(?:\.\d+)?", s)
+  if not nums:
+    return None
+
+  val = float(nums[0])
+  s_lower = s.lower()
+  if "lower" in s_lower or "below" in s_lower or "under" in s_lower:
     return val - 0.5
-  if "higher" in bucket_str.lower() or "above" in bucket_str.lower():
+  if "higher" in s_lower or "above" in s_lower or "over" in s_lower:
     return val + 0.5
+
   return val
 
 
 def match_temp_to_bucket(temp_native, poly_prices):
-  """Matches temperature to market buckets using native contract units (°C or °F)."""
+  """Matches native unit temperature to market buckets handling ranges and open-ended bounds."""
   if temp_native is None or not poly_prices:
     return None, None, False
 
   rounded_val = int(round(temp_native))
 
   for bucket_label, prob in poly_prices.items():
-    if f"{rounded_val}°" in bucket_label:
+    lbl = str(bucket_label).strip()
+    lbl_lower = lbl.lower()
+
+    if f"{rounded_val}°" in lbl or f"{rounded_val} °" in lbl:
       return bucket_label, prob, True
 
-    numbers = [float(n) for n in re.findall(r"-?\d+", bucket_label)]
-    if len(numbers) == 2 and "-" in bucket_label:
-      if numbers[0] <= temp_native <= numbers[1]:
+    range_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", lbl)
+    if range_match:
+      low = float(range_match.group(1))
+      high = float(range_match.group(2))
+      if low <= temp_native <= high:
         return bucket_label, prob, True
-    elif len(numbers) == 1:
-      bound_val = numbers[0]
-      label_lower = bucket_label.lower()
+      continue
+
+    nums = re.findall(r"\d+(?:\.\d+)?", lbl)
+    if nums:
+      bound_val = float(nums[0])
       if (
-          "higher" in label_lower or "above" in label_lower
+          "higher" in lbl_lower or "above" in lbl_lower or "over" in lbl_lower
       ) and temp_native >= bound_val:
         return bucket_label, prob, True
       if (
-          "lower" in label_lower or "below" in label_lower
+          "lower" in lbl_lower or "below" in lbl_lower or "under" in lbl_lower
       ) and temp_native <= bound_val:
         return bucket_label, prob, True
 
@@ -453,7 +470,7 @@ def log_snapshot():
     predicted_bucket = ecmwf_bucket
     polymarket_price = ecmwf_bucket_prob
 
-    # 5. Market Implied Temperature (Always standardized to °C for the CSV)
+    # 5. Market Implied Temperature (Standardized to °C for CSV)
     mkt_implied_native, sum_prob = compute_market_implied_temp(poly_prices)
     mkt_implied_c = (
         f_to_c(mkt_implied_native)
