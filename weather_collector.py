@@ -4,13 +4,13 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# 1. CITIES CONFIGURATION (Configured with dynamic slug tags & search overrides)
+# 1. CITIES CONFIGURATION (Added 'unit' flag to handle US Fahrenheit contracts)
 CITIES = {
     "Hong Kong": {
         "lat": 22.3193,
@@ -18,6 +18,7 @@ CITIES = {
         "tz": "Asia/Hong_Kong",
         "slug_tag": "hong-kong",
         "search_term": "Highest temperature in Hong Kong",
+        "unit": "C",
     },
     "Tokyo": {
         "lat": 35.6762,
@@ -25,6 +26,7 @@ CITIES = {
         "tz": "Asia/Tokyo",
         "slug_tag": "tokyo",
         "search_term": "Highest temperature in Tokyo",
+        "unit": "C",
     },
     "Shanghai": {
         "lat": 31.2304,
@@ -32,6 +34,7 @@ CITIES = {
         "tz": "Asia/Shanghai",
         "slug_tag": "shanghai",
         "search_term": "Highest temperature in Shanghai",
+        "unit": "C",
     },
     "Qingdao": {
         "lat": 36.0671,
@@ -39,6 +42,7 @@ CITIES = {
         "tz": "Asia/Shanghai",
         "slug_tag": "qingdao",
         "search_term": "Highest temperature in Qingdao",
+        "unit": "C",
     },
     "Seoul": {
         "lat": 37.5665,
@@ -46,6 +50,7 @@ CITIES = {
         "tz": "Asia/Seoul",
         "slug_tag": "seoul",
         "search_term": "Highest temperature in Seoul",
+        "unit": "C",
     },
     "Guangzhou": {
         "lat": 23.1291,
@@ -53,6 +58,7 @@ CITIES = {
         "tz": "Asia/Shanghai",
         "slug_tag": "guangzhou",
         "search_term": "Highest temperature in Guangzhou",
+        "unit": "C",
     },
     "Shenzhen": {
         "lat": 22.5431,
@@ -60,6 +66,7 @@ CITIES = {
         "tz": "Asia/Shanghai",
         "slug_tag": "shenzhen",
         "search_term": "Highest temperature in Shenzhen",
+        "unit": "C",
     },
     "New York": {
         "lat": 40.7128,
@@ -67,6 +74,7 @@ CITIES = {
         "tz": "America/New_York",
         "slug_tag": "nyc",
         "search_term": "Highest temperature in NYC",
+        "unit": "F",
     },
     "Chicago": {
         "lat": 41.8781,
@@ -74,6 +82,7 @@ CITIES = {
         "tz": "America/Chicago",
         "slug_tag": "chicago",
         "search_term": "Highest temperature in Chicago",
+        "unit": "F",
     },
     "Miami": {
         "lat": 25.7617,
@@ -81,6 +90,7 @@ CITIES = {
         "tz": "America/New_York",
         "slug_tag": "miami",
         "search_term": "Highest temperature in Miami",
+        "unit": "F",
     },
     "London": {
         "lat": 51.5074,
@@ -88,6 +98,7 @@ CITIES = {
         "tz": "Europe/London",
         "slug_tag": "london",
         "search_term": "Highest temperature in London",
+        "unit": "C",
     },
     "Paris": {
         "lat": 48.8566,
@@ -95,6 +106,7 @@ CITIES = {
         "tz": "Europe/Paris",
         "slug_tag": "paris",
         "search_term": "Highest temperature in Paris",
+        "unit": "C",
     },
     "Ankara": {
         "lat": 39.9334,
@@ -102,6 +114,7 @@ CITIES = {
         "tz": "Europe/Istanbul",
         "slug_tag": "ankara",
         "search_term": "Highest temperature in Ankara",
+        "unit": "C",
     },
     "Buenos Aires": {
         "lat": -34.6037,
@@ -109,12 +122,12 @@ CITIES = {
         "tz": "America/Argentina/Buenos_Aires",
         "slug_tag": "buenos-aires",
         "search_term": "Highest temperature in Buenos Aires",
+        "unit": "C",
     },
 }
 
 CSV_FILE = "polymarket_weather_live_log.csv"
 
-# SCHEMA ORDERING
 CSV_COLUMNS = [
     "timestamp_utc",
     "city",
@@ -142,8 +155,17 @@ CSV_COLUMNS = [
 ]
 
 
+def c_to_f(c_temp):
+  """Converts Celsius to Fahrenheit."""
+  return (c_temp * 9 / 5) + 32 if c_temp is not None else None
+
+
+def f_to_c(f_temp):
+  """Converts Fahrenheit to Celsius."""
+  return (f_temp - 32) * 5 / 9 if f_temp is not None else None
+
+
 def create_resilient_session(retries=3, backoff_factor=1):
-  """Creates a requests.Session with HTTP retries configured."""
   session = requests.Session()
   retry_strategy = Retry(
       total=retries,
@@ -158,7 +180,6 @@ def create_resilient_session(retries=3, backoff_factor=1):
 
 
 def get_weather_forecast(lat, lon, tz, max_retries=3):
-  """Fetches ECMWF/GFS daily maximum predictions strictly for the city's LOCAL calendar day."""
   url = (
       f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
       f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone={tz}"
@@ -171,7 +192,6 @@ def get_weather_forecast(lat, lon, tz, max_retries=3):
       if res.status_code == 200:
         data = res.json()
         if "daily" in data and "time" in data["daily"]:
-          # Convert daily array into a date-indexed dict
           forecasts = {}
           for idx, date_str in enumerate(data["daily"]["time"]):
             forecasts[date_str] = {
@@ -193,7 +213,6 @@ def get_weather_forecast(lat, lon, tz, max_retries=3):
 
 
 def parse_event_markets(event_data):
-  """Extracts raw outcome prices into a dict."""
   bucket_prices = {}
   if not event_data or "markets" not in event_data:
     return bucket_prices
@@ -217,20 +236,14 @@ def parse_event_markets(event_data):
 
 
 def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
-  """Checks live Polymarket events against candidate local dates (e.g.
-
-  today / tomorrow).
-  """
   session = create_resilient_session()
   slug_tag = city_info["slug_tag"]
 
-  # Check forecast dates in order (e.g., today's local date, then tomorrow's local date)
   for target_date_str in forecast_dates:
     dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     month_name = dt.strftime("%B").lower()
     day_num = dt.day
 
-    # Strategy 1: Dynamic Slug Generation
     patterns = [
         f"highest-temperature-in-{slug_tag}-on-{month_name}-{day_num}",
         f"highest-temperature-in-{slug_tag}-on-{month_name}-{day_num}-{dt.year}",
@@ -249,7 +262,6 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
       except Exception:
         pass
 
-    # Strategy 2: Flexible API Search Fallback
     search_query = city_info.get(
         "search_term", f"Highest temperature in {city_name}"
     )
@@ -265,8 +277,6 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
         if isinstance(events, list):
           for event in events:
             title = event.get("title", "").lower()
-
-            # Check if this active market title corresponds to the target date
             if (
                 "temperature" in title
                 and month_name in title
@@ -278,48 +288,22 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
     except Exception:
       pass
 
-  # Default fallback if no active date market is found
   default_target = (
       forecast_dates[1] if len(forecast_dates) > 1 else forecast_dates[0]
   )
   return default_target, {}
 
 
-def match_temp_to_bucket(temp_c, poly_prices):
-  """Maps a decimal temperature to the explicit Polymarket bucket contract."""
-  if temp_c is None or not poly_prices:
-    return None, None, False
-
-  rounded_val = int(round(temp_c))
-  exact_key = f"{rounded_val}°C"
-
-  if exact_key in poly_prices:
-    return exact_key, poly_prices[exact_key], True
-
-  for bucket_label, prob in poly_prices.items():
-    label_lower = bucket_label.lower()
-    numbers = re.findall(r"-?\d+", bucket_label)
-
-    if numbers:
-      bound_val = float(numbers[0])
-      if (
-          "higher" in label_lower or "above" in label_lower
-      ) and temp_c >= bound_val:
-        return bucket_label, prob, True
-      if (
-          "lower" in label_lower or "below" in label_lower
-      ) and temp_c <= bound_val:
-        return bucket_label, prob, True
-
-  return None, None, False
-
-
 def parse_bucket_midpoint(bucket_str):
-  """Extracts numerical midpoint temperature for statistical expected value calculation."""
-  numbers = re.findall(r"-?\d+", str(bucket_str))
+  """Parses range buckets like '82-83°F' or single degree buckets like '30°C' cleanly into numerical midpoints."""
+  numbers = [float(n) for n in re.findall(r"-?\d+", str(bucket_str))]
   if not numbers:
     return None
-  val = float(numbers[0])
+
+  if len(numbers) >= 2 and "-" in bucket_str:
+    return (numbers[0] + numbers[1]) / 2.0
+
+  val = numbers[0]
   if "lower" in bucket_str.lower() or "below" in bucket_str.lower():
     return val - 0.5
   if "higher" in bucket_str.lower() or "above" in bucket_str.lower():
@@ -327,8 +311,38 @@ def parse_bucket_midpoint(bucket_str):
   return val
 
 
+def match_temp_to_bucket(temp_native, poly_prices):
+  """Matches temperature to market buckets using native contract units (°C or °F)."""
+  if temp_native is None or not poly_prices:
+    return None, None, False
+
+  rounded_val = int(round(temp_native))
+
+  for bucket_label, prob in poly_prices.items():
+    if f"{rounded_val}°" in bucket_label:
+      return bucket_label, prob, True
+
+    numbers = [float(n) for n in re.findall(r"-?\d+", bucket_label)]
+    if len(numbers) == 2 and "-" in bucket_label:
+      if numbers[0] <= temp_native <= numbers[1]:
+        return bucket_label, prob, True
+    elif len(numbers) == 1:
+      bound_val = numbers[0]
+      label_lower = bucket_label.lower()
+      if (
+          "higher" in label_lower or "above" in label_lower
+      ) and temp_native >= bound_val:
+        return bucket_label, prob, True
+      if (
+          "lower" in label_lower or "below" in label_lower
+      ) and temp_native <= bound_val:
+        return bucket_label, prob, True
+
+  return None, None, False
+
+
 def compute_market_implied_temp(prices_dict):
-  """Calculates probability-weighted mean: sum(Price * BucketTemp) / sum(Prices)."""
+  """Calculates probability-weighted average temperature in the market's native units."""
   if not prices_dict:
     return None, 0.0
 
@@ -348,7 +362,6 @@ def compute_market_implied_temp(prices_dict):
 
 
 def load_previous_snapshot():
-  """Loads most recent logged snapshot per city for calculating inter-observation deltas."""
   if not os.path.exists(CSV_FILE):
     return {}
   try:
@@ -379,8 +392,9 @@ def log_snapshot():
   for city_name, info in CITIES.items():
     time.sleep(0.3)
     quality_issues = []
+    unit = info.get("unit", "C")
 
-    # 1. Fetch Local Weather Forecasts
+    # 1. Fetch Local Weather Forecasts (°C)
     try:
       forecasts_by_date = get_weather_forecast(
           info["lat"], info["lon"], info["tz"]
@@ -391,14 +405,18 @@ def log_snapshot():
       candidate_dates = [now_dt.strftime("%Y-%m-%d")]
       quality_issues.append("WEATHER_FETCH_FAILED")
 
-    # 2. Match Active Polymarket Event across candidate local dates
+    # 2. Fetch Active Market Prices
     target_date, poly_prices = get_polymarket_prices_multi_date(
         city_name, info, candidate_dates
     )
 
     day_weather = forecasts_by_date.get(target_date, {})
-    ecmwf_t = day_weather.get("ecmwf")
-    gfs_t = day_weather.get("gfs")
+    ecmwf_t_c = day_weather.get("ecmwf")
+    gfs_t_c = day_weather.get("gfs")
+
+    # Convert forecast to native unit (°F for US, °C for others)
+    ecmwf_native = c_to_f(ecmwf_t_c) if unit == "F" else ecmwf_t_c
+    gfs_native = c_to_f(gfs_t_c) if unit == "F" else gfs_t_c
 
     if not poly_prices:
       quality_issues.append("MISSING_POLYMARKET_PRICES")
@@ -416,61 +434,68 @@ def log_snapshot():
     # 4. Spreads & Bucket Matching
     model_spread_c = None
     abs_model_spread_c = None
-
-    if ecmwf_t is not None and gfs_t is not None:
-      model_spread_c = round(ecmwf_t - gfs_t, 2)
+    if ecmwf_t_c is not None and gfs_t_c is not None:
+      model_spread_c = round(ecmwf_t_c - gfs_t_c, 2)
       abs_model_spread_c = round(abs(model_spread_c), 2)
 
     ecmwf_bucket, ecmwf_bucket_prob, ecmwf_valid = match_temp_to_bucket(
-        ecmwf_t, poly_prices
+        ecmwf_native, poly_prices
     )
-    if ecmwf_t is not None and poly_prices and not ecmwf_valid:
+    if ecmwf_t_c is not None and poly_prices and not ecmwf_valid:
       quality_issues.append("ECMWF_BUCKET_MAPPING_AMBIGUOUS")
 
     gfs_bucket, gfs_bucket_prob, gfs_valid = match_temp_to_bucket(
-        gfs_t, poly_prices
+        gfs_native, poly_prices
     )
-    if gfs_t is not None and poly_prices and not gfs_valid:
+    if gfs_t_c is not None and poly_prices and not gfs_valid:
       quality_issues.append("GFS_BUCKET_MAPPING_AMBIGUOUS")
 
     predicted_bucket = ecmwf_bucket
     polymarket_price = ecmwf_bucket_prob
 
-    # 5. Market Implied Temperature
-    mkt_implied_t, sum_prob = compute_market_implied_temp(poly_prices)
+    # 5. Market Implied Temperature (Always standardized to °C for the CSV)
+    mkt_implied_native, sum_prob = compute_market_implied_temp(poly_prices)
+    mkt_implied_c = (
+        f_to_c(mkt_implied_native)
+        if (unit == "F" and mkt_implied_native is not None)
+        else mkt_implied_native
+    )
+    if mkt_implied_c is not None:
+      mkt_implied_c = round(mkt_implied_c, 2)
+
     if poly_prices and sum_prob < 0.50:
       quality_issues.append("LOW_TOTAL_MARKET_PROBABILITY")
 
     mkt_vs_ecmwf = (
-        round(mkt_implied_t - ecmwf_t, 2)
-        if (mkt_implied_t is not None and ecmwf_t is not None)
+        round(mkt_implied_c - ecmwf_t_c, 2)
+        if (mkt_implied_c is not None and ecmwf_t_c is not None)
         else None
     )
     mkt_vs_gfs = (
-        round(mkt_implied_t - gfs_t, 2)
-        if (mkt_implied_t is not None and gfs_t is not None)
+        round(mkt_implied_c - gfs_t_c, 2)
+        if (mkt_implied_c is not None and gfs_t_c is not None)
         else None
     )
 
     # 6. Inter-run Deltas
     city_prev = prev_data.get(city_name, {})
     ecmwf_change = (
-        round(ecmwf_t - city_prev["ecmwf_max_c"], 2)
+        round(ecmwf_t_c - city_prev["ecmwf_max_c"], 2)
         if (
-            ecmwf_t is not None
+            ecmwf_t_c is not None
             and pd.notnull(city_prev.get("ecmwf_max_c"))
         )
         else None
     )
     gfs_change = (
-        round(gfs_t - city_prev["gfs_max_c"], 2)
-        if (gfs_t is not None and pd.notnull(city_prev.get("gfs_max_c")))
+        round(gfs_t_c - city_prev["gfs_max_c"], 2)
+        if (gfs_t_c is not None and pd.notnull(city_prev.get("gfs_max_c")))
         else None
     )
     mkt_change = (
-        round(mkt_implied_t - city_prev["market_implied_temp_c"], 2)
+        round(mkt_implied_c - city_prev["market_implied_temp_c"], 2)
         if (
-            mkt_implied_t is not None
+            mkt_implied_c is not None
             and pd.notnull(city_prev.get("market_implied_temp_c"))
         )
         else None
@@ -484,8 +509,8 @@ def log_snapshot():
         "timestamp_utc": now_utc_str,
         "city": city_name,
         "target_date": target_date,
-        "ecmwf_max_c": ecmwf_t,
-        "gfs_max_c": gfs_t,
+        "ecmwf_max_c": ecmwf_t_c,
+        "gfs_max_c": gfs_t_c,
         "predicted_bucket": predicted_bucket,
         "polymarket_price": polymarket_price,
         "all_bucket_prices": all_bucket_json,
@@ -495,7 +520,7 @@ def log_snapshot():
         "abs_model_spread_c": abs_model_spread_c,
         "ecmwf_run_utc": None,
         "gfs_run_utc": None,
-        "market_implied_temp_c": mkt_implied_t,
+        "market_implied_temp_c": mkt_implied_c,
         "market_vs_ecmwf_c": mkt_vs_ecmwf,
         "market_vs_gfs_c": mkt_vs_gfs,
         "ecmwf_bucket_probability": ecmwf_bucket_prob,
