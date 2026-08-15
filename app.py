@@ -9,8 +9,8 @@ st.set_page_config(
 )
 
 
-# Fetch data directly from local file (or raw GitHub link if needed)
-@st.cache_data(ttl=60)  # Caches for 60 seconds, then auto-refreshes
+# Fetch data directly from file (Auto-invalidates cache every 60s)
+@st.cache_data(ttl=60)
 def load_data():
     df = pd.read_csv("polymarket_weather_evaluated.csv")
     return df
@@ -20,7 +20,13 @@ df = load_data()
 
 st.title("☀️ Weather Market Value & EV Tracker")
 
-# Sidebar Controls
+# Sidebar Controls & Manual Reload
+st.sidebar.header("Controls")
+if st.sidebar.button("🔄 Force Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.divider()
 st.sidebar.header("Strategy Settings")
 target_date = st.sidebar.selectbox(
     "Select Target Date",
@@ -30,7 +36,7 @@ min_ev = st.sidebar.slider(
     "Minimum Expected Value (EV %)", min_value=0, max_value=500, value=50
 )
 
-# Filter Data
+# Filter Data for Selected Target Date
 df_active = df[df["target_date"] == target_date].copy()
 latest = (
     df_active.sort_values("timestamp_utc").groupby("city").last().reset_index()
@@ -45,6 +51,7 @@ latest["ev_percentage"] = (
     * 100
 )
 latest["gfs_diff"] = latest["gfs_max_c"] - latest["ecmwf_max_c"]
+
 
 # Action Recommendation Logic
 def get_recommendation(row):
@@ -96,6 +103,12 @@ st.dataframe(
             "ev_percentage": "Expected Value (EV %)",
         }
     ),
+    column_config={
+        "Poly Market Price": st.column_config.NumberColumn(format="$%.3f"),
+        "Expected Value (EV %)": st.column_config.NumberColumn(format="+%.1f%%"),
+        "ECMWF (°C)": st.column_config.NumberColumn(format="%.1f °C"),
+        "GFS (°C)": st.column_config.NumberColumn(format="%.1f °C"),
+    },
     use_container_width=True,
     hide_index=True,
 )
