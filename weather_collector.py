@@ -2,12 +2,15 @@ import json
 import math
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
-# 1. CITIES LIST (Expand as needed for active Polymarket cities)
+# 1. CITIES LIST (14 Cities fully configured)
 CITIES = {
     "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "slug": "hong-kong"},
     "Tokyo": {"lat": 35.6762, "lon": 139.6503, "slug": "tokyo"},
@@ -55,22 +58,133 @@ CSV_COLUMNS = [
 ]
 
 
-def match_temp_to_bucket(temp_c, poly_prices):
-  """Maps a decimal temperature to the explicit Polymarket bucket contract without blind assumptions.
+def create_resilient_session(retries=3, backoff_factor=1):
+  """Creates a requests.Session with HTTP retries configured."""
+  session = requests.Session()
+  retry_strategy = Retry(
+      total=retries,
+      backoff_factor=backoff_factor,
+      status_forcelist=[429, 500, 502, 503, 504],
+      raise_on_status=False,
+  )
+  adapter = HTTPAdapter(max_retries=retry_strategy)
+  session.mount("https://", adapter)
+  session.mount("http://", adapter)
+  return session
 
-  Returns (bucket_label, probability, is_unambiguous).
-  """
+
+def get_weather_forecast(lat, lon, max_retries=3):
+  """Fetches ECMWF/GFS daily maximum predictions with automatic retries and exponential backoff."""
+  url = (
+      f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone=UTC"
+  )
+  session = create_resilient_session(retries=max_retries)
+
+  for attempt in range(1, max_retries + 1):
+    try:
+      res = session.get(url, timeout=10)
+      if res.status_code == 200:
+        data = res.json()
+        if "daily" in data and "time" in data["daily"]:
+          target_date = data["daily"]["time"][1]
+          ecmwf_max = data["daily"]["temperature_2m_max_ecmwf_ifs025"][1]
+          gfs_max = data["daily"]["temperature_2m_max_gfs_seamless"][1]
+          return target_date, ecmwf_max, gfs_max
+
+      time.sleep(attempt * 1.5)
+    except (requests.RequestException, KeyError, IndexError) as e:
+      if attempt == max_retries:
+        raise e
+      time.sleep(attempt * 1.5)
+
+  raise RuntimeError(
+      f"Failed to fetch weather data for ({lat}, {lon}) after {max_retries}"
+      " attempts."
+  )
+
+
+def parse_event_markets(event_data):
+  """Extracts raw outcome prices into a dict."""
+  bucket_prices = {}
+  if not event_data or "markets" not in event_data:
+    return bucket_prices
+
+  for market in event_data.get("markets", []):
+    bucket = market.get("groupItemTitle") or market.get("question")
+    raw_prices = market.get("outcomePrices")
+
+    if bucket and raw_prices:
+      prices = (
+          json.loads(raw_prices)
+          if isinstance(raw_prices, str)
+          else raw_prices
+      )
+      if prices:
+        try:
+          bucket_prices[bucket] = float(prices[0])
+        except (ValueError, TypeError):
+          continue
+  return bucket_prices
+
+
+def get_polymarket_prices(city_name, city_slug, target_date_str):
+  """Fetches active Polymarket prices using resilient session."""
+  session = create_resilient_session()
+  dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+  month_name = dt.strftime("%B").lower()
+
+  event_slug = (
+      f"highest-temperature-in-{city_slug}-on-{month_name}-{dt.day}-{dt.year}"
+  )
+  url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
+
+  try:
+    res = session.get(url_slug, timeout=10)
+    if res.status_code == 200:
+      prices = parse_event_markets(res.json())
+      if prices:
+        return prices
+  except Exception:
+    pass
+
+  # Search Fallback
+  url_search = "https://gamma-api.polymarket.com/events"
+  try:
+    res = session.get(
+        url_search,
+        params={"active": "true", "closed": "false", "q": city_name},
+        timeout=10,
+    )
+    if res.status_code == 200:
+      events = res.json()
+      if isinstance(events, list):
+        for event in events:
+          title = event.get("title", "").lower()
+          desc = event.get("description", "").lower()
+          if "highest temperature" in title and (
+              target_date_str in title or target_date_str in desc
+          ):
+            prices = parse_event_markets(event)
+            if prices:
+              return prices
+  except Exception:
+    pass
+
+  return {}
+
+
+def match_temp_to_bucket(temp_c, poly_prices):
+  """Maps a decimal temperature to the explicit Polymarket bucket contract without blind assumptions."""
   if temp_c is None or not poly_prices:
     return None, None, False
 
-  # Method 1: Check for exact integer bucket matching (Standard Polymarket 1°C integer buckets)
   rounded_val = int(round(temp_c))
   exact_key = f"{rounded_val}°C"
 
   if exact_key in poly_prices:
     return exact_key, poly_prices[exact_key], True
 
-  # Method 2: Evaluate boundary buckets (e.g. "32°C or higher", "25°C or lower")
   for bucket_label, prob in poly_prices.items():
     label_lower = bucket_label.lower()
     numbers = re.findall(r"-?\d+", bucket_label)
@@ -82,7 +196,6 @@ def match_temp_to_bucket(temp_c, poly_prices):
       if ("lower" in label_lower or "below" in label_lower) and temp_c <= bound_val:
         return bucket_label, prob, True
 
-  # If no contract bucket strictly maps to the temperature value:
   return None, None, False
 
 
@@ -119,90 +232,6 @@ def compute_market_implied_temp(prices_dict):
   return None, 0.0
 
 
-def get_weather_forecast(lat, lon):
-  """Fetches ECMWF/GFS daily maximum predictions."""
-  url = (
-      f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone=UTC"
-  )
-  res = requests.get(url, timeout=10).json()
-
-  target_date = res["daily"]["time"][1]
-  ecmwf_max = res["daily"]["temperature_2m_max_ecmwf_ifs025"][1]
-  gfs_max = res["daily"]["temperature_2m_max_gfs_seamless"][1]
-
-  return target_date, ecmwf_max, gfs_max
-
-
-def parse_event_markets(event_data):
-  """Extracts raw outcome prices into a dict."""
-  bucket_prices = {}
-  if not event_data or "markets" not in event_data:
-    return bucket_prices
-
-  for market in event_data.get("markets", []):
-    bucket = market.get("groupItemTitle") or market.get("question")
-    raw_prices = market.get("outcomePrices")
-
-    if bucket and raw_prices:
-      prices = (
-          json.loads(raw_prices)
-          if isinstance(raw_prices, str)
-          else raw_prices
-      )
-      if prices:
-        try:
-          bucket_prices[bucket] = float(prices[0])
-        except (ValueError, TypeError):
-          continue
-  return bucket_prices
-
-
-def get_polymarket_prices(city_name, city_slug, target_date_str):
-  """Fetches active Polymarket prices."""
-  dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-  month_name = dt.strftime("%B").lower()
-
-  event_slug = (
-      f"highest-temperature-in-{city_slug}-on-{month_name}-{dt.day}-{dt.year}"
-  )
-  url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
-
-  try:
-    res = requests.get(url_slug, timeout=10)
-    if res.status_code == 200:
-      prices = parse_event_markets(res.json())
-      if prices:
-        return prices
-  except Exception:
-    pass
-
-  # Search Fallback
-  url_search = "https://gamma-api.polymarket.com/events"
-  try:
-    res = requests.get(
-        url_search,
-        params={"active": "true", "closed": "false", "q": city_name},
-        timeout=10,
-    )
-    if res.status_code == 200:
-      events = res.json()
-      if isinstance(events, list):
-        for event in events:
-          title = event.get("title", "").lower()
-          desc = event.get("description", "").lower()
-          if "highest temperature" in title and (
-              target_date_str in title or target_date_str in desc
-          ):
-            prices = parse_event_markets(event)
-            if prices:
-              return prices
-  except Exception:
-    pass
-
-  return {}
-
-
 def load_previous_snapshot():
   """Loads most recent logged snapshot per city for calculating inter-observation deltas."""
   if not os.path.exists(CSV_FILE):
@@ -233,9 +262,10 @@ def log_snapshot():
   records = []
 
   for city_name, info in CITIES.items():
+    time.sleep(0.5)  # Pace requests to respect API rate limits
     quality_issues = []
 
-    # 1. Fetch Forecast
+    # 1. Fetch Weather
     try:
       target_date, ecmwf_t, gfs_t = get_weather_forecast(
           info["lat"], info["lon"]
@@ -263,7 +293,7 @@ def log_snapshot():
           (target_midnight_utc - now_dt).total_seconds() / 3600.0, 2
       )
 
-    # 4. Spreads & Strict Contract Bucket Matching
+    # 4. Spreads & Bucket Matching
     model_spread_c = None
     abs_model_spread_c = None
 
@@ -271,14 +301,12 @@ def log_snapshot():
       model_spread_c = round(ecmwf_t - gfs_t, 2)
       abs_model_spread_c = round(abs(model_spread_c), 2)
 
-    # Match ECMWF
     ecmwf_bucket, ecmwf_bucket_prob, ecmwf_valid = match_temp_to_bucket(
         ecmwf_t, poly_prices
     )
     if ecmwf_t is not None and poly_prices and not ecmwf_valid:
       quality_issues.append("ECMWF_BUCKET_MAPPING_AMBIGUOUS")
 
-    # Match GFS
     gfs_bucket, gfs_bucket_prob, gfs_valid = match_temp_to_bucket(
         gfs_t, poly_prices
     )
@@ -328,7 +356,7 @@ def log_snapshot():
         else None
     )
 
-    # 7. Construct Row Record
+    # 7. Construct Record
     all_bucket_json = json.dumps(poly_prices, ensure_ascii=False)
     data_quality = "OK" if not quality_issues else "|".join(quality_issues)
 
