@@ -180,8 +180,12 @@ def verify_and_settle():
         print(f"  ✗ {city} on {target_date}: Data not available yet.")
 
   if not actual_results:
-    print("No actual temperature data found yet. Try again tomorrow.")
-    return
+    print(
+        "No actual temperature data found yet (target dates likely"
+        " haven't finished yet). Still writing the evaluated CSV so the"
+        " dashboard reflects the latest raw log data -- settlement"
+        " columns will simply be empty for unresolved rows."
+    )
 
   # Map numerical actual temperatures.
   # NOTE: renamed from actual_max_c -> actual_max_c_openmeteo_proxy to be
