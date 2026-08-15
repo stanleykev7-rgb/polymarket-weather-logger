@@ -322,7 +322,7 @@ def parse_bucket_midpoint(bucket_str):
 
 
 def match_temp_to_bucket(temp_native, poly_prices):
-  """Matches native unit temperature to market buckets handling ranges and open-ended bounds."""
+  """Matches native unit temperature to market buckets, handling ranges, degree symbols, and boundary rounding."""
   if temp_native is None or not poly_prices:
     return None, None, False
 
@@ -332,27 +332,34 @@ def match_temp_to_bucket(temp_native, poly_prices):
     lbl = str(bucket_label).strip()
     lbl_lower = lbl.lower()
 
+    # 1. Direct degree match (e.g., "30°C", "84°F")
     if f"{rounded_val}°" in lbl or f"{rounded_val} °" in lbl:
       return bucket_label, prob, True
 
+    # 2. Range match with rounded boundary tolerance (e.g., "82-83°F", "84-85°F")
     range_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", lbl)
     if range_match:
       low = float(range_match.group(1))
       high = float(range_match.group(2))
-      if low <= temp_native <= high:
+
+      # Check both float range and rounded integer range
+      if (
+          (low - 0.5) <= temp_native <= (high + 0.5)
+      ) or low <= rounded_val <= high:
         return bucket_label, prob, True
       continue
 
+    # 3. Single bounded matches (e.g., "84°F or higher", "75°F or below")
     nums = re.findall(r"\d+(?:\.\d+)?", lbl)
     if nums:
       bound_val = float(nums[0])
       if (
           "higher" in lbl_lower or "above" in lbl_lower or "over" in lbl_lower
-      ) and temp_native >= bound_val:
+      ) and temp_native >= (bound_val - 0.5):
         return bucket_label, prob, True
       if (
           "lower" in lbl_lower or "below" in lbl_lower or "under" in lbl_lower
-      ) and temp_native <= bound_val:
+      ) and temp_native <= (bound_val + 0.5):
         return bucket_label, prob, True
 
   return None, None, False
