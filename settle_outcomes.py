@@ -2,13 +2,13 @@ import csv
 from datetime import datetime
 import json
 import os
+import re
 import pandas as pd
 import requests
 
 INPUT_CSV = "polymarket_weather_live_log.csv"
 EVALUATED_CSV = "polymarket_weather_evaluated.csv"
 
-# Fully synchronized 14-city configuration (matching log_snapshot)
 CITIES = {
     "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C"},
     "Tokyo": {"lat": 35.6762, "lon": 139.6503, "unit": "C"},
@@ -28,12 +28,10 @@ CITIES = {
 
 
 def c_to_f(c_temp):
-  """Converts Celsius to Fahrenheit for US markets."""
   return (c_temp * 9 / 5) + 32 if c_temp is not None else None
 
 
 def get_actual_max_temp(lat, lon, target_date_str):
-  """Fetch actual historical observed max temperature (°C) from Open-Meteo Archive API."""
   url = (
       f"https://archive-api.open-meteo.com/v1/archive?"
       f"latitude={lat}&longitude={lon}&start_date={target_date_str}&end_date={target_date_str}"
@@ -47,11 +45,52 @@ def get_actual_max_temp(lat, lon, target_date_str):
       if temps and temps[0] is not None:
         return temps[0]
   except Exception as e:
-    print(
-        f"[Error] Failed to fetch actual temp for ({lat}, {lon}) on"
-        f" {target_date_str}: {e}"
-    )
+    print(f"[Error] Failed to fetch temp for ({lat}, {lon}): {e}")
   return None
+
+
+def match_observed_to_bucket(temp_native, poly_prices):
+  """Matches observed temperature to actual market range buckets dynamically."""
+  if temp_native is None or not poly_prices:
+    return None
+
+  rounded_val = int(round(temp_native))
+
+  for bucket_label in poly_prices.keys():
+    lbl = str(bucket_label).strip()
+    lbl_lower = lbl.lower()
+
+    # Range match (e.g., "84-85°F")
+    range_match = re.search(
+        r"(-?\d+(?:\.\d+)?)\s*(?:-|to)\s*(-?\d+(?:\.\d+)?)", lbl
+    )
+    if range_match:
+      low = float(range_match.group(1))
+      high = float(range_match.group(2))
+      if (
+          (low - 0.5) <= temp_native <= (high + 0.5)
+      ) or low <= rounded_val <= high:
+        return bucket_label
+      continue
+
+    # Single degree match (e.g., "30°C")
+    if re.search(r"\b" + str(rounded_val) + r"\s*°", lbl):
+      return bucket_label
+
+    # Bounded matches (e.g., "94°F or higher", "75°F or below")
+    nums = re.findall(r"-?\d+(?:\.\d+)?", lbl)
+    if nums:
+      bound_val = float(nums[0])
+      if (
+          "higher" in lbl_lower or "above" in lbl_lower or "over" in lbl_lower
+      ) and temp_native >= (bound_val - 0.5):
+        return bucket_label
+      if (
+          "lower" in lbl_lower or "below" in lbl_lower or "under" in lbl_lower
+      ) and temp_native <= (bound_val + 0.5):
+        return bucket_label
+
+  return f"{rounded_val}°"
 
 
 def verify_and_settle():
@@ -86,16 +125,13 @@ def verify_and_settle():
       )
 
       if actual_temp_c is not None:
-        # Convert to native unit to construct the correct outcome bucket label
         native_temp = (
             c_to_f(actual_temp_c) if unit == "F" else actual_temp_c
         )
-        actual_bucket = f"{int(round(native_temp))}°{unit}"
-
-        actual_results[(city, target_date)] = (actual_temp_c, actual_bucket)
+        actual_results[(city, target_date)] = (actual_temp_c, native_temp)
         print(
             f"  ✓ {city} on {target_date}: {actual_temp_c}°C"
-            f" ({native_temp:.1f}°{unit}) -> {actual_bucket}"
+            f" ({native_temp:.1f}°{unit})"
         )
       else:
         print(f"  ✗ {city} on {target_date}: Data not available yet.")
@@ -104,20 +140,39 @@ def verify_and_settle():
     print("No actual temperature data found yet. Try again tomorrow.")
     return
 
+  # Map numerical actual temperatures
   df["actual_max_c"] = df.apply(
       lambda r: actual_results.get((r["city"], str(r["target_date"])), (None, None))[
           0
       ],
       axis=1,
   )
-  df["actual_bucket"] = df.apply(
-      lambda r: actual_results.get((r["city"], str(r["target_date"])), (None, None))[
-          1
-      ],
-      axis=1,
-  )
 
-  df["ecmwf_hit"] = df["predicted_bucket"] == df["actual_bucket"]
+  # Dynamic Bucket Evaluation
+  def evaluate_row(row):
+    city = row["city"]
+    actual_c = row["actual_max_c"]
+    if actual_c is None or city not in CITIES:
+      return None, False
+
+    unit = CITIES[city]["unit"]
+    native_temp = c_to_f(actual_c) if unit == "F" else actual_c
+
+    # Safely load json prices to match winning bucket label
+    poly_prices = {}
+    if pd.notnull(row["all_bucket_prices"]):
+      try:
+        poly_prices = json.loads(row["all_bucket_prices"])
+      except Exception:
+        pass
+
+    winning_bucket = match_observed_to_bucket(native_temp, poly_prices)
+    hit = str(row["predicted_bucket"]).strip() == str(winning_bucket).strip()
+    return winning_bucket, hit
+
+  eval_res = df.apply(evaluate_row, axis=1)
+  df["actual_bucket"] = [res[0] for res in eval_res]
+  df["ecmwf_hit"] = [res[1] for res in eval_res]
 
   df.to_csv(
       EVALUATED_CSV,
