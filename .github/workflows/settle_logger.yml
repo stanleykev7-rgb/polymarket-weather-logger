@@ -17,10 +17,12 @@ jobs:
         with:
           python-version: '3.10'
       - run: pip install requests pandas
+      - name: Recover legacy mixed-schema rows (safe to re-run; read-only on the raw log)
+        run: python recover_legacy_log.py
       - run: python settle_outcomes.py
       - run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add polymarket_weather_evaluated.csv
+          git add polymarket_weather_evaluated.csv recovered/
           git commit -m "Auto-update outcome settlement [skip ci]" || exit 0
           git push
