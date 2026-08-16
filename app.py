@@ -146,7 +146,10 @@ else:
         "gfs_max_c": "GFS (°C)",
         "gfs_bucket": "GFS Bucket",
         "gfs_bucket_probability": "Mkt Price of GFS Bucket",
-        "model_spread_c": "Model Spread (°C)",
+        "icon_max_c": "ICON (°C)",
+        "icon_bucket": "ICON Bucket",
+        "icon_bucket_probability": "Mkt Price of ICON Bucket",
+        "model_spread_c": "ECMWF-GFS Spread (°C)",
         "market_modal_bucket": "Market Favorite Bucket",
         "market_modal_bucket_price": "Favorite Bucket Price",
         "market_implied_temp_c": "Market Implied Temp (°C)",
@@ -162,10 +165,12 @@ else:
         column_config={
             "ECMWF (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "GFS (°C)": st.column_config.NumberColumn(format="%.1f °C"),
-            "Model Spread (°C)": st.column_config.NumberColumn(format="%+.1f °C"),
+            "ICON (°C)": st.column_config.NumberColumn(format="%.1f °C"),
+            "ECMWF-GFS Spread (°C)": st.column_config.NumberColumn(format="%+.1f °C"),
             "Market Implied Temp (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "Mkt Price of ECMWF Bucket": st.column_config.NumberColumn(format="%.3f"),
             "Mkt Price of GFS Bucket": st.column_config.NumberColumn(format="%.3f"),
+            "Mkt Price of ICON Bucket": st.column_config.NumberColumn(format="%.3f"),
             "Favorite Bucket Price": st.column_config.NumberColumn(format="%.3f"),
             "Lead Time (h)": st.column_config.NumberColumn(format="%.1f"),
         },
@@ -194,21 +199,24 @@ else:
         st.caption("model_spread_c not available for this data.")
 
     st.subheader("🌡️ Market Implied Temp vs. Each Model")
-    needed = {"market_implied_temp_c", "ecmwf_max_c", "gfs_max_c"}
-    if needed.issubset(latest.columns):
+    base_needed = {"market_implied_temp_c", "ecmwf_max_c", "gfs_max_c"}
+    if base_needed.issubset(latest.columns):
+        value_vars = ["market_implied_temp_c", "ecmwf_max_c", "gfs_max_c"]
+        rename_map = {
+            "market_implied_temp_c": "Market Implied",
+            "ecmwf_max_c": "ECMWF",
+            "gfs_max_c": "GFS",
+        }
+        if has_col(latest, "icon_max_c"):
+            value_vars.append("icon_max_c")
+            rename_map["icon_max_c"] = "ICON"
         plot_df = latest.melt(
             id_vars="city",
-            value_vars=["market_implied_temp_c", "ecmwf_max_c", "gfs_max_c"],
+            value_vars=value_vars,
             var_name="source",
             value_name="temp_c",
         )
-        plot_df["source"] = plot_df["source"].map(
-            {
-                "market_implied_temp_c": "Market Implied",
-                "ecmwf_max_c": "ECMWF",
-                "gfs_max_c": "GFS",
-            }
-        )
+        plot_df["source"] = plot_df["source"].map(rename_map)
         fig2 = px.bar(
             plot_df, x="city", y="temp_c", color="source", barmode="group",
             labels={"temp_c": "°C", "city": "City", "source": ""},

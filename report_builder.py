@@ -27,6 +27,7 @@ LEAD_TIME_LABELS = ["<24h", "24-48h", "48-72h", "3-7d", "7d+"]
 MODEL_HIT_COLS = {
     "ECMWF": "ecmwf_hit",
     "GFS": "gfs_hit",
+    "ICON": "icon_hit",
     "Market Favorite": "market_favorite_hit",
 }
 
@@ -156,7 +157,7 @@ def compute_city_temp_accuracy(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for city, group in known.groupby("city"):
         row = {"city": city, "n": len(group)}
-        for model, col in {"ECMWF": "ecmwf_max_c", "GFS": "gfs_max_c"}.items():
+        for model, col in {"ECMWF": "ecmwf_max_c", "GFS": "gfs_max_c", "ICON": "icon_max_c"}.items():
             if col in group.columns:
                 diffs = (group[col] - group["actual_max_c_used"]).abs().dropna()
                 row[f"{model}_mae_c"] = diffs.mean() if len(diffs) else None
@@ -291,7 +292,7 @@ def generate_insights(
 # ---------------------------------------------------------------------------
 # Chart helpers (shared between PNG and DOCX paths)
 # ---------------------------------------------------------------------------
-_COLORS = {"ECMWF": "#4C72B0", "GFS": "#DD8452", "Market Favorite": "#55A868"}
+_COLORS = {"ECMWF": "#4C72B0", "GFS": "#DD8452", "ICON": "#8172B2", "Market Favorite": "#55A868"}
 
 
 def _plot_hit_rate_by(ax, table: pd.DataFrame, x_col: str, title: str):
@@ -300,19 +301,21 @@ def _plot_hit_rate_by(ax, table: pd.DataFrame, x_col: str, title: str):
         ax.set_title(title)
         return
     x = range(len(table))
-    width = 0.25
+    n_models = len(MODEL_HIT_COLS)
+    width = min(0.8 / n_models, 0.25)
     for i, model in enumerate(MODEL_HIT_COLS):
         rate_col = f"{model}_hit_rate"
         if rate_col not in table.columns:
             continue
-        offsets = [xi + (i - 1) * width for xi in x]
+        offset = (i - (n_models - 1) / 2) * width
+        offsets = [xi + offset for xi in x]
         ax.bar(offsets, table[rate_col].fillna(0), width=width, label=model, color=_COLORS[model])
     ax.set_xticks(list(x))
     ax.set_xticklabels(table[x_col].astype(str), rotation=30, ha="right")
     ax.set_ylim(0, 1)
     ax.set_ylabel("Hit Rate")
     ax.set_title(title)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
 
 def _plot_city_comparison(ax, city_table: pd.DataFrame, title: str, max_cities: int = 14):
@@ -322,19 +325,21 @@ def _plot_city_comparison(ax, city_table: pd.DataFrame, title: str, max_cities: 
         return
     table = city_table.head(max_cities).sort_values("city")
     x = range(len(table))
-    width = 0.25
+    n_models = len(MODEL_HIT_COLS)
+    width = min(0.8 / n_models, 0.25)
     for i, model in enumerate(MODEL_HIT_COLS):
         rate_col = f"{model}_hit_rate"
         if rate_col not in table.columns:
             continue
-        offsets = [xi + (i - 1) * width for xi in x]
+        offset = (i - (n_models - 1) / 2) * width
+        offsets = [xi + offset for xi in x]
         ax.bar(offsets, table[rate_col].fillna(0), width=width, label=model, color=_COLORS[model])
     ax.set_xticks(list(x))
     ax.set_xticklabels(table["city"].astype(str), rotation=45, ha="right")
     ax.set_ylim(0, 1)
     ax.set_ylabel("Hit Rate")
     ax.set_title(title)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
 
 def _render_charts_figure(daily: pd.DataFrame, lead: pd.DataFrame, scope_label: str) -> plt.Figure:

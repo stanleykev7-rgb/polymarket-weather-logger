@@ -139,3 +139,36 @@ i.e. everything collected before the 2026-08 audit fixes. This does
 **not** delete or modify any file — it only changes what the current
 dashboard session displays. Turn it on for a "clean slate" view; leave
 it off to see the full historical dataset.
+
+## Schema v3: ICON added as a third forecast model (2026-08, later same day)
+
+DWD's ICON model (`dwd_icon_seamless` in Open-Meteo's API — global
+~11km, blended with higher-resolution ICON EU/D2 near Europe; sometimes
+called "ICON13" from its older 13km global resolution) was added
+alongside ECMWF and GFS. It's requested in the same Open-Meteo API call
+as ECMWF/GFS, so this adds no extra network round-trip per polling
+cycle.
+
+New columns: `icon_max_c`, `icon_bucket`, `icon_bucket_probability`,
+`icon_change_c` (collector); `icon_hit` (settlement). `ICON` was also
+added to the report's model comparison set (`report_builder.py`) and
+the Live Snapshot table (`app.py`).
+
+**Deliberately NOT changed:** `model_spread_c`/`abs_model_spread_c`
+stay strictly ECMWF-vs-GFS, for continuity with every existing row and
+because that's what "model disagreement" has meant throughout this
+project so far. ICON's accuracy is evaluated independently via its own
+bucket/hit-rate/MAE metrics rather than folded into that spread
+calculation. A three-way spread field can be added later if useful.
+
+Since this changes the collector's column count again, new rows will
+route to `polymarket_weather_live_log_v3.csv` (or higher) the same way
+the v2 rows did — see the schema-versioning mechanism described above.
+
+Adding a 4th, 5th, etc. model later (Open-Meteo supports UKMO, GEM,
+JMA, KMA, Météo-France and others in the same API call) follows the
+same pattern: add it to the `models=` request, parse its
+`temperature_2m_max_{model_id}` field, add the 4 corresponding
+columns, and it'll show up automatically in the report and dashboard
+since those already iterate generically over whatever models are
+present.

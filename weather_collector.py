@@ -159,12 +159,20 @@ CSV_FILE = "polymarket_weather_live_log.csv"
 # (polymarket_weather_live_log_v2.csv) rather than appended under the
 # old header. See data_utils.resolve_write_target /
 # data_utils.load_combined_log.
+#
+# --- SCHEMA v3 (2026-08, later same day) --------------------------------
+# Added ICON (DWD) as a third forecast model alongside ECMWF/GFS:
+# icon_max_c, icon_bucket, icon_bucket_probability, icon_change_c.
+# Same column-count-changed-so-route-to-a-new-file mechanism applies --
+# this will land in polymarket_weather_live_log_v3.csv once the first
+# row with this column set is written.
 CSV_COLUMNS = [
     "timestamp_utc",
     "city",
     "target_date",
     "ecmwf_max_c",
     "gfs_max_c",
+    "icon_max_c",
     "predicted_bucket",  # legacy meaning preserved: == ecmwf_bucket
     "polymarket_price",  # legacy meaning preserved: == ecmwf_bucket_probability
     "all_bucket_prices",
@@ -182,10 +190,13 @@ CSV_COLUMNS = [
     "ecmwf_bucket_probability",
     "gfs_bucket",
     "gfs_bucket_probability",
+    "icon_bucket",
+    "icon_bucket_probability",
     "market_modal_bucket",
     "market_modal_bucket_price",
     "ecmwf_change_c",
     "gfs_change_c",
+    "icon_change_c",
     "market_implied_change_c",
     "data_quality",
 ]
@@ -216,9 +227,14 @@ def create_resilient_session(retries=3, backoff_factor=1):
 
 
 def get_weather_forecast(lat, lon, tz, max_retries=3):
+  # Third model added 2026-08: DWD ICON ("dwd_icon_seamless" -- DWD's
+  # global ICON model, ~11km, blended with higher-resolution ICON EU/D2
+  # near Europe where available; sometimes referred to as "ICON13" from
+  # its older 13km global resolution). Requested in the SAME API call as
+  # ECMWF/GFS, so this adds no extra network round-trip.
   url = (
       f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless&timezone={tz}"
+      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless,dwd_icon_seamless&timezone={tz}"
   )
   session = create_resilient_session(retries=max_retries)
 
@@ -229,10 +245,17 @@ def get_weather_forecast(lat, lon, tz, max_retries=3):
         data = res.json()
         if "daily" in data and "time" in data["daily"]:
           forecasts = {}
-          for idx, date_str in enumerate(data["daily"]["time"]):
+          daily = data["daily"]
+          for idx, date_str in enumerate(daily["time"]):
             forecasts[date_str] = {
-                "ecmwf": data["daily"]["temperature_2m_max_ecmwf_ifs025"][idx],
-                "gfs": data["daily"]["temperature_2m_max_gfs_seamless"][idx],
+                "ecmwf": daily["temperature_2m_max_ecmwf_ifs025"][idx],
+                "gfs": daily["temperature_2m_max_gfs_seamless"][idx],
+                # .get(...) with a fallback list, not a plain index,
+                # so a temporary gap in ICON's response (a field this
+                # API has occasionally omitted for some locations)
+                # degrades to a missing value instead of crashing the
+                # whole snapshot for ECMWF/GFS too.
+                "icon": daily.get("temperature_2m_max_dwd_icon_seamless", [None] * len(daily["time"]))[idx],
             }
           return forecasts
 
@@ -460,6 +483,7 @@ def load_previous_snapshot():
       last_records[city] = {
           "ecmwf_max_c": last_row.get("ecmwf_max_c"),
           "gfs_max_c": last_row.get("gfs_max_c"),
+          "icon_max_c": last_row.get("icon_max_c"),
           "market_implied_temp_c": last_row.get("market_implied_temp_c"),
       }
     return last_records
@@ -499,10 +523,12 @@ def log_snapshot():
     day_weather = forecasts_by_date.get(target_date, {})
     ecmwf_t_c = day_weather.get("ecmwf")
     gfs_t_c = day_weather.get("gfs")
+    icon_t_c = day_weather.get("icon")
 
     # Convert forecast to native unit (°F for US, °C for others)
     ecmwf_native = c_to_f(ecmwf_t_c) if unit == "F" else ecmwf_t_c
     gfs_native = c_to_f(gfs_t_c) if unit == "F" else gfs_t_c
+    icon_native = c_to_f(icon_t_c) if unit == "F" else icon_t_c
 
     if not poly_prices:
       quality_issues.append("MISSING_POLYMARKET_PRICES")
@@ -512,6 +538,12 @@ def log_snapshot():
     lead_time_hours = compute_lead_time_hours(now_dt, target_date, info["tz"])
 
     # 4. Spreads & Bucket Matching
+    # NOTE: model_spread_c / abs_model_spread_c stay strictly ECMWF vs
+    # GFS (unchanged meaning, for continuity with every existing row).
+    # ICON doesn't get its own spread field yet -- its bucket/hit-rate
+    # comparison below is enough to evaluate it independently; add a
+    # dedicated icon_vs_ecmwf_c-style field later if that 3-way spread
+    # becomes useful for analysis.
     model_spread_c = None
     abs_model_spread_c = None
     if ecmwf_t_c is not None and gfs_t_c is not None:
@@ -529,6 +561,14 @@ def log_snapshot():
     )
     if gfs_t_c is not None and poly_prices and not gfs_valid:
       quality_issues.append("GFS_BUCKET_MAPPING_AMBIGUOUS")
+
+    icon_bucket, icon_bucket_prob, icon_valid = match_temp_to_bucket(
+        icon_native, poly_prices
+    )
+    if icon_t_c is not None and poly_prices and not icon_valid:
+      quality_issues.append("ICON_BUCKET_MAPPING_AMBIGUOUS")
+    if icon_t_c is None:
+      quality_issues.append("ICON_FORECAST_MISSING")
 
     # NOTE (schema v2): predicted_bucket/polymarket_price keep their
     # ORIGINAL as-implemented meaning (ECMWF-matched bucket) for
@@ -588,6 +628,11 @@ def log_snapshot():
         if (gfs_t_c is not None and pd.notnull(city_prev.get("gfs_max_c")))
         else None
     )
+    icon_change = (
+        round(icon_t_c - city_prev["icon_max_c"], 2)
+        if (icon_t_c is not None and pd.notnull(city_prev.get("icon_max_c")))
+        else None
+    )
     mkt_change = (
         round(mkt_implied_c - city_prev["market_implied_temp_c"], 2)
         if (
@@ -612,6 +657,7 @@ def log_snapshot():
         "target_date": target_date,
         "ecmwf_max_c": ecmwf_t_c,
         "gfs_max_c": gfs_t_c,
+        "icon_max_c": icon_t_c,
         "predicted_bucket": predicted_bucket,  # legacy meaning: == ecmwf_bucket
         "polymarket_price": polymarket_price,  # legacy meaning: == ecmwf_bucket_probability
         "all_bucket_prices": all_bucket_json,
@@ -629,10 +675,13 @@ def log_snapshot():
         "ecmwf_bucket_probability": ecmwf_bucket_prob,
         "gfs_bucket": gfs_bucket,
         "gfs_bucket_probability": gfs_bucket_prob,
+        "icon_bucket": icon_bucket,
+        "icon_bucket_probability": icon_bucket_prob,
         "market_modal_bucket": market_modal_bucket,
         "market_modal_bucket_price": market_modal_bucket_price,
         "ecmwf_change_c": ecmwf_change,
         "gfs_change_c": gfs_change,
+        "icon_change_c": icon_change,
         "market_implied_change_c": mkt_change,
         "data_quality": data_quality,
     })
