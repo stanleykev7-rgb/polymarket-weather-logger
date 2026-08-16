@@ -3,8 +3,11 @@ from datetime import datetime
 import json
 import os
 import re
+import time
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 from data_utils import load_combined_log
 from official_settlement_sources import fetch_official_actual_max_c
@@ -57,7 +60,29 @@ def c_to_f(c_temp):
   )
 
 
-def get_actual_max_temp(lat, lon, target_date_str, iana_tz):
+def _create_resilient_session(retries=3, backoff_factor=1.5):
+  session = requests.Session()
+  retry_strategy = Retry(
+      total=retries,
+      backoff_factor=backoff_factor,
+      status_forcelist=[429, 500, 502, 503, 504],
+      raise_on_status=False,
+  )
+  adapter = HTTPAdapter(max_retries=retry_strategy)
+  session.mount("https://", adapter)
+  session.mount("http://", adapter)
+  return session
+
+
+# Reused across all Open-Meteo Archive calls in a run rather than
+# creating a fresh connection pool per city -- also gets us automatic
+# retry/backoff on read timeouts and 429/5xx responses, which the raw
+# `requests.get(..., timeout=15)` previously had none of. This mirrors
+# the pattern already used in weather_collector.py.
+_ARCHIVE_SESSION = _create_resilient_session()
+
+
+def get_actual_max_temp(lat, lon, target_date_str, iana_tz, max_retries=3):
   # FIX (audit CRITICAL-3): aggregate the daily max over the city's
   # LOCAL calendar day, not the UTC calendar day. target_date_str is a
   # local date (matching the Polymarket market's named date); passing
@@ -69,15 +94,21 @@ def get_actual_max_temp(lat, lon, target_date_str, iana_tz):
       f"latitude={lat}&longitude={lon}&start_date={target_date_str}&end_date={target_date_str}"
       f"&daily=temperature_2m_max&timezone={iana_tz}"
   )
-  try:
-    res = requests.get(url, timeout=15)
-    if res.status_code == 200:
-      data = res.json()
-      temps = data.get("daily", {}).get("temperature_2m_max", [])
-      if temps and temps[0] is not None:
-        return temps[0]
-  except Exception as e:
-    print(f"[Error] Failed to fetch temp for ({lat}, {lon}): {e}")
+  for attempt in range(1, max_retries + 1):
+    try:
+      res = _ARCHIVE_SESSION.get(url, timeout=20)
+      if res.status_code == 200:
+        data = res.json()
+        temps = data.get("daily", {}).get("temperature_2m_max", [])
+        if temps and temps[0] is not None:
+          return temps[0]
+        return None  # Valid response, genuinely no data for this date yet.
+      # Non-200 that Retry() didn't already handle -- fall through to backoff.
+    except requests.exceptions.RequestException as e:
+      if attempt == max_retries:
+        print(f"[Error] Failed to fetch temp for ({lat}, {lon}) after {max_retries} attempts: {e}")
+        return None
+    time.sleep(attempt * 2)
   return None
 
 
