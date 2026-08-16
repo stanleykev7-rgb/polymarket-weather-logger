@@ -258,7 +258,7 @@ def verify_and_settle():
     city = row["city"]
     actual_c = row["actual_max_c_used"]
     if actual_c is None or pd.isna(actual_c) or city not in CITIES:
-      return None, None
+      return None, None, None, None
 
     unit = CITIES[city]["unit"]
     native_temp = c_to_f(actual_c) if unit == "F" else actual_c
@@ -276,15 +276,34 @@ def verify_and_settle():
       # a miss. Previously this fell through to hit=False, which is
       # indistinguishable from "ECMWF genuinely predicted the wrong
       # bucket" in later analysis.
-      return None, None
+      return None, None, None, None
 
-    predicted = row.get("predicted_bucket")
-    hit = (
-        str(predicted).strip() == str(winning_bucket).strip()
-        if pd.notnull(predicted)
-        else None
-    )
-    return winning_bucket, hit
+    def _bucket_hit(bucket_val):
+      if bucket_val is None:
+        return None
+      if isinstance(bucket_val, float) and pd.isna(bucket_val):
+        return None
+      return str(bucket_val).strip() == str(winning_bucket).strip()
+
+    # ecmwf_hit kept exactly as before (against legacy predicted_bucket,
+    # which == the ECMWF-matched bucket -- see SCHEMA.md) for continuity
+    # with every prior row's ecmwf_hit value.
+    ecmwf_hit = _bucket_hit(row.get("predicted_bucket"))
+
+    # NEW: the equivalent comparison for GFS and for the market's own
+    # favorite (modal) bucket. Only populated for rows that have these
+    # v2-schema fields -- None for legacy rows, same as the fields
+    # themselves being absent.
+    gfs_hit = _bucket_hit(row.get("gfs_bucket"))
+    market_favorite_hit = _bucket_hit(row.get("market_modal_bucket"))
+
+    return winning_bucket, ecmwf_hit, gfs_hit, market_favorite_hit
+
+  eval_res = df.apply(evaluate_row, axis=1)
+  df["actual_bucket"] = [res[0] for res in eval_res]
+  df["ecmwf_hit"] = [res[1] for res in eval_res]
+  df["gfs_hit"] = [res[2] for res in eval_res]
+  df["market_favorite_hit"] = [res[3] for res in eval_res]
 
   eval_res = df.apply(evaluate_row, axis=1)
   df["actual_bucket"] = [res[0] for res in eval_res]

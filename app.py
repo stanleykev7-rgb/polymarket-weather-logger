@@ -4,6 +4,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import report_builder as rb
+
 st.set_page_config(
     page_title="PolyMarket Weather Data Explorer",
     layout="wide",
@@ -371,3 +373,54 @@ else:
 st.caption(
     "Field definitions and known limitations: see SCHEMA.md in the repo."
 )
+
+# ===========================================================================
+# SECTION 4 — Downloadable performance report
+# ===========================================================================
+st.divider()
+st.header("📄 Performance Report")
+st.caption(
+    "Generates a day-by-day, lead-time-by-lead-time comparison of ECMWF, "
+    "GFS, and the market's own favorite bucket, as a downloadable PNG or "
+    "Word document you can share. Built from settled rows only "
+    "(same data as the Backtesting section above) -- descriptive, not a "
+    "trading recommendation."
+)
+
+report_col1, report_col2 = st.columns(2)
+with report_col1:
+    report_scope = st.radio(
+        "Scope", options=["All Cities Combined", "Single City"], horizontal=True
+    )
+report_city = None
+if report_scope == "Single City":
+    with report_col2:
+        report_city = st.selectbox("Choose city", options=all_cities, key="report_city_select")
+
+gen_col1, gen_col2 = st.columns(2)
+with gen_col1:
+    if st.button("🖼️ Generate PNG Report"):
+        png_bytes = rb.build_png_report(df, city=report_city)
+        st.session_state["_report_png"] = png_bytes
+with gen_col2:
+    if st.button("📝 Generate Word Report"):
+        docx_bytes = rb.build_docx_report(df, city=report_city)
+        st.session_state["_report_docx"] = docx_bytes
+
+if "_report_png" in st.session_state:
+    st.image(st.session_state["_report_png"], caption="Preview")
+    st.download_button(
+        "Download PNG",
+        data=st.session_state["_report_png"],
+        file_name=f"weather_model_report_{(report_city or 'all_cities').replace(' ', '_').lower()}.png",
+        mime="image/png",
+    )
+
+if "_report_docx" in st.session_state:
+    st.download_button(
+        "Download Word Document (.docx)",
+        data=st.session_state["_report_docx"],
+        file_name=f"weather_model_report_{(report_city or 'all_cities').replace(' ', '_').lower()}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    st.caption("Word document generated -- preview isn't shown inline, use the download button above.")
