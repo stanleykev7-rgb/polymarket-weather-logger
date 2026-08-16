@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write # Grants write permissions to commit changes back to the repo
 
+concurrency:
+  group: weather-logger
+  cancel-in-progress: false
+
 jobs:
   run-logger:
     runs-on: ubuntu-latest
@@ -28,7 +32,7 @@ jobs:
       - name: Run Collector Script
         run: python weather_collector.py
 
-      - name: Commit and Push Log Changes
+      - name: Commit and push (retry with rebase on conflict)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -38,4 +42,19 @@ jobs:
           # both patterns keeps whichever file(s) actually changed.
           git add polymarket_weather_live_log.csv polymarket_weather_live_log_v*.csv 2>/dev/null || true
           git commit -m "Auto-update weather log snapshot [skip ci]" || exit 0
-          git push
+
+          # The Daily Outcome Settler workflow commits to the same branch
+          # independently, so a push here can be rejected if it landed a
+          # commit in between our checkout and our push. Retry a few
+          # times with a rebase pull rather than failing the whole job.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+            echo "Push rejected (attempt $i/5) -- pulling and retrying..."
+            git pull --rebase origin main
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "Failed to push after 5 attempts."
+          exit 1
