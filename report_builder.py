@@ -103,6 +103,72 @@ def compute_lead_time_performance(df: pd.DataFrame, city: str | None = None) -> 
     return pd.DataFrame(rows)
 
 
+def compute_city_performance(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per city: bucket hit rate for each model, plus the
+    "best model" for that city (highest hit rate, ties broken by
+    whichever's listed first in MODEL_HIT_COLS). This directly answers
+    "which city does each model track best" at the bucket level.
+    """
+    settled = _settled_subset(df, city=None)
+    if settled.empty:
+        return pd.DataFrame(columns=["city", "n", "best_model"] + [f"{m}_hit_rate" for m in MODEL_HIT_COLS])
+
+    rows = []
+    for city, group in settled.groupby("city"):
+        row = {"city": city, "n": len(group)}
+        rates = {}
+        for model, col in MODEL_HIT_COLS.items():
+            if col in group.columns:
+                vals = group[col].dropna()
+                rate = vals.mean() if len(vals) else None
+                row[f"{model}_hit_rate"] = rate
+                row[f"{model}_n"] = len(vals)
+                if rate is not None:
+                    rates[model] = rate
+            else:
+                row[f"{model}_hit_rate"] = None
+                row[f"{model}_n"] = 0
+        row["best_model"] = max(rates, key=rates.get) if rates else None
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("n", ascending=False)
+
+
+def compute_city_temp_accuracy(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per city: mean absolute error (°C) between each model's
+    forecast and the actual settled temperature. This is a finer-grained
+    answer to "how closely does this city follow the models" than the
+    bucket hit rate above -- a city can just barely miss its bucket
+    every time (small MAE, 0% hit rate) or hit the bucket by chance with
+    a forecast that was actually far off (larger MAE, high hit rate).
+    Look at both together, not just one.
+
+    Only uses rows where actual_max_c_used is known -- does not require
+    a resolved bucket match, so this can include rows evaluate_row()
+    couldn't map to a bucket.
+    """
+    if "actual_max_c_used" not in df.columns:
+        return pd.DataFrame(columns=["city", "n", "ECMWF_mae_c", "GFS_mae_c"])
+
+    known = df[df["actual_max_c_used"].notna()].copy()
+    if known.empty:
+        return pd.DataFrame(columns=["city", "n", "ECMWF_mae_c", "GFS_mae_c"])
+
+    rows = []
+    for city, group in known.groupby("city"):
+        row = {"city": city, "n": len(group)}
+        for model, col in {"ECMWF": "ecmwf_max_c", "GFS": "gfs_max_c"}.items():
+            if col in group.columns:
+                diffs = (group[col] - group["actual_max_c_used"]).abs().dropna()
+                row[f"{model}_mae_c"] = diffs.mean() if len(diffs) else None
+                row[f"{model}_mae_n"] = len(diffs)
+            else:
+                row[f"{model}_mae_c"] = None
+                row[f"{model}_mae_n"] = 0
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("n", ascending=False)
+
+
+
 def compute_overall_summary(df: pd.DataFrame, city: str | None = None) -> dict:
     settled = _settled_subset(df, city)
     summary = {"scope": city or "All Cities", "settled_n": len(settled)}
@@ -117,7 +183,10 @@ def compute_overall_summary(df: pd.DataFrame, city: str | None = None) -> dict:
     return summary
 
 
-def generate_insights(summary: dict, daily: pd.DataFrame, lead: pd.DataFrame) -> list[str]:
+def generate_insights(
+    summary: dict, daily: pd.DataFrame, lead: pd.DataFrame,
+    city_perf: pd.DataFrame | None = None, city_mae: pd.DataFrame | None = None,
+) -> list[str]:
     """Small set of auto-generated, plainly-worded observations. These
     are DESCRIPTIVE statements about what's in the data, not trading
     recommendations -- deliberately no "buy/sell"/"edge" language.
@@ -165,6 +234,54 @@ def generate_insights(summary: dict, daily: pd.DataFrame, lead: pd.DataFrame) ->
             "crowd' is simply right, independent of either model."
         )
 
+    # --- Per-city findings (only meaningful in the all-cities report) ---
+    if city_perf is not None and not city_perf.empty:
+        MIN_CITY_N = 10  # don't call out a city's "best model" on a handful of rows
+        reliable = city_perf[city_perf["n"] >= MIN_CITY_N].dropna(subset=["best_model"])
+        if not reliable.empty:
+            counts = reliable["best_model"].value_counts()
+            lead_model = counts.idxmax()
+            insights.append(
+                f"{lead_model} was the best-performing model (by bucket hit "
+                f"rate) in {counts[lead_model]} of {len(reliable)} cities "
+                f"with at least {MIN_CITY_N} settled observations."
+            )
+            # Highlight the single strongest and weakest ECMWF city as a
+            # concrete example, since that's usually the model people
+            # ask about first.
+            ecmwf_rates = reliable.dropna(subset=["ECMWF_hit_rate"])
+            if len(ecmwf_rates) >= 2:
+                best_row = ecmwf_rates.loc[ecmwf_rates["ECMWF_hit_rate"].idxmax()]
+                worst_row = ecmwf_rates.loc[ecmwf_rates["ECMWF_hit_rate"].idxmin()]
+                if best_row["city"] != worst_row["city"]:
+                    insights.append(
+                        f"ECMWF's bucket hit rate ranged from "
+                        f"{worst_row['ECMWF_hit_rate']*100:.0f}% in {worst_row['city']} "
+                        f"to {best_row['ECMWF_hit_rate']*100:.0f}% in {best_row['city']} "
+                        f"-- accuracy is not uniform across cities."
+                    )
+        elif len(city_perf) > 0:
+            insights.append(
+                f"No single city has {MIN_CITY_N}+ settled observations yet, "
+                "so per-city model comparisons aren't reliable yet -- check "
+                "back once more data accumulates."
+            )
+
+    if city_mae is not None and not city_mae.empty:
+        reliable_mae = city_mae[city_mae["n"] >= 10].dropna(subset=["ECMWF_mae_c", "GFS_mae_c"])
+        if not reliable_mae.empty:
+            tightest = reliable_mae.loc[
+                reliable_mae[["ECMWF_mae_c", "GFS_mae_c"]].min(axis=1).idxmin()
+            ]
+            insights.append(
+                f"{tightest['city']} had the tightest forecast-to-actual "
+                f"temperature gap in this sample (ECMWF off by "
+                f"{tightest['ECMWF_mae_c']:.1f}°C, GFS by "
+                f"{tightest['GFS_mae_c']:.1f}°C on average) -- note this is "
+                "a temperature-error view, which can disagree with the "
+                "bucket-hit-rate view above for cities near a bucket edge."
+            )
+
     if not insights:
         insights.append("Not enough settled data yet to generate insights.")
 
@@ -198,6 +315,28 @@ def _plot_hit_rate_by(ax, table: pd.DataFrame, x_col: str, title: str):
     ax.legend(fontsize=8)
 
 
+def _plot_city_comparison(ax, city_table: pd.DataFrame, title: str, max_cities: int = 14):
+    if city_table.empty:
+        ax.text(0.5, 0.5, "Not enough data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    table = city_table.head(max_cities).sort_values("city")
+    x = range(len(table))
+    width = 0.25
+    for i, model in enumerate(MODEL_HIT_COLS):
+        rate_col = f"{model}_hit_rate"
+        if rate_col not in table.columns:
+            continue
+        offsets = [xi + (i - 1) * width for xi in x]
+        ax.bar(offsets, table[rate_col].fillna(0), width=width, label=model, color=_COLORS[model])
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(table["city"].astype(str), rotation=45, ha="right")
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Hit Rate")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+
+
 def _render_charts_figure(daily: pd.DataFrame, lead: pd.DataFrame, scope_label: str) -> plt.Figure:
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
     _plot_hit_rate_by(axes[0], daily, "target_date", f"Hit Rate by Day - {scope_label}")
@@ -214,10 +353,16 @@ def build_png_report(df: pd.DataFrame, city: str | None = None) -> bytes:
     summary = compute_overall_summary(df, city)
     daily = compute_daily_performance(df, city)
     lead = compute_lead_time_performance(df, city)
-    insights = generate_insights(summary, daily, lead)
+    city_perf = compute_city_performance(df) if city is None else None
+    city_mae = compute_city_temp_accuracy(df) if city is None else None
+    insights = generate_insights(summary, daily, lead, city_perf, city_mae)
 
-    fig = plt.figure(figsize=(11, 7.5))
-    gs = fig.add_gridspec(3, 2, height_ratios=[0.7, 2.4, 1.1], hspace=0.55)
+    show_city_panel = city is None and city_perf is not None and not city_perf.empty
+
+    fig = plt.figure(figsize=(11, 11.5 if show_city_panel else 7.5))
+    n_rows = 4 if show_city_panel else 3
+    height_ratios = [1.0, 2.4, 2.6, 1.6] if show_city_panel else [0.7, 2.4, 1.1]
+    gs = fig.add_gridspec(n_rows, 2, height_ratios=height_ratios, hspace=0.7)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -227,20 +372,26 @@ def build_png_report(df: pd.DataFrame, city: str | None = None) -> bytes:
         f"Weather Market Model Performance Report -- {scope_label}\n"
         f"Generated {generated}  |  Settled observations: {summary['settled_n']}"
     )
-    ax_header.text(0, 0.6, header_text, fontsize=13, fontweight="bold", va="top")
+    ax_header.text(0, 0.95, header_text, fontsize=13, fontweight="bold", va="top")
     hit_rate_line = "   ".join(
         f"{m}: {summary[f'{m}_hit_rate']*100:.0f}% (n={summary[f'{m}_n']})"
         if summary.get(f"{m}_hit_rate") is not None else f"{m}: n/a"
         for m in MODEL_HIT_COLS
     )
-    ax_header.text(0, 0.1, hit_rate_line, fontsize=10, va="top")
+    ax_header.text(0, 0.15, hit_rate_line, fontsize=10, va="top")
 
     ax1 = fig.add_subplot(gs[1, 0])
     _plot_hit_rate_by(ax1, daily, "target_date", "Hit Rate by Day")
     ax2 = fig.add_subplot(gs[1, 1])
     _plot_hit_rate_by(ax2, lead, "lead_bucket", "Hit Rate by Lead Time")
 
-    ax_insights = fig.add_subplot(gs[2, :])
+    insights_row = 2
+    if show_city_panel:
+        ax_city = fig.add_subplot(gs[2, :])
+        _plot_city_comparison(ax_city, city_perf, "Hit Rate by City (which city each model tracks best)")
+        insights_row = 3
+
+    ax_insights = fig.add_subplot(gs[insights_row, :])
     ax_insights.axis("off")
     insight_text = "Insights:\n" + "\n".join(f"- {i}" for i in insights)
     ax_insights.text(0, 1.0, insight_text, fontsize=9, va="top", wrap=True)
@@ -272,7 +423,9 @@ def build_docx_report(df: pd.DataFrame, city: str | None = None) -> bytes:
     summary = compute_overall_summary(df, city)
     daily = compute_daily_performance(df, city)
     lead = compute_lead_time_performance(df, city)
-    insights = generate_insights(summary, daily, lead)
+    city_perf = compute_city_performance(df) if city is None else None
+    city_mae = compute_city_temp_accuracy(df) if city is None else None
+    insights = generate_insights(summary, daily, lead, city_perf, city_mae)
 
     doc = Document()
 
@@ -348,6 +501,63 @@ def build_docx_report(df: pd.DataFrame, city: str | None = None) -> bytes:
                 rate = r.get(f"{model}_hit_rate")
                 cells[i].text = f"{rate*100:.0f}%" if pd.notnull(rate) else "n/a"
             cells[-1].text = str(int(r["n"]))
+
+    # --- Per-city breakdown: the key "which city follows which model"
+    # view -- only meaningful in the all-cities report; a single-city
+    # report is already scoped to one city.
+    if city is None and city_perf is not None and not city_perf.empty:
+        doc.add_heading("Performance by City", level=2)
+        doc.add_paragraph(
+            "Bucket hit rate per city, per model. 'Best Model' is whichever "
+            "had the highest hit rate for that city (blank if fewer than "
+            "10 settled observations -- too little data to call it)."
+        )
+
+        fig_city, ax_city = plt.subplots(figsize=(9, 4))
+        _plot_city_comparison(ax_city, city_perf, "Hit Rate by City")
+        city_img_buf = io.BytesIO()
+        fig_city.savefig(city_img_buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig_city)
+        city_img_buf.seek(0)
+        doc.add_picture(city_img_buf, width=Inches(6.3))
+
+        t3 = doc.add_table(rows=1, cols=2 + len(MODEL_HIT_COLS) + 1)
+        t3.style = "Light Grid Accent 1"
+        hdr = t3.rows[0].cells
+        hdr[0].text = "City"
+        for i, model in enumerate(MODEL_HIT_COLS, start=1):
+            hdr[i].text = f"{model} Hit Rate"
+        hdr[-2].text = "n"
+        hdr[-1].text = "Best Model"
+        for _, r in city_perf.iterrows():
+            cells = t3.add_row().cells
+            cells[0].text = str(r["city"])
+            for i, model in enumerate(MODEL_HIT_COLS, start=1):
+                rate = r.get(f"{model}_hit_rate")
+                cells[i].text = f"{rate*100:.0f}%" if pd.notnull(rate) else "n/a"
+            cells[-2].text = str(int(r["n"]))
+            cells[-1].text = str(r.get("best_model") or "-") if r["n"] >= 10 else "-"
+
+        if city_mae is not None and not city_mae.empty:
+            doc.add_heading("Forecast Temperature Accuracy by City (\u00b0C)", level=3)
+            doc.add_paragraph(
+                "Mean absolute error between each model's forecast and the "
+                "actual settled temperature -- a finer-grained view than "
+                "bucket hit rate above. A city can narrowly miss its "
+                "bucket every time (small error, low hit rate) or hit by "
+                "chance with a forecast that was actually far off."
+            )
+            t4 = doc.add_table(rows=1, cols=3)
+            t4.style = "Light Grid Accent 1"
+            hdr = t4.rows[0].cells
+            hdr[0].text, hdr[1].text, hdr[2].text = "City", "ECMWF MAE (\u00b0C)", "GFS MAE (\u00b0C)"
+            for _, r in city_mae.iterrows():
+                cells = t4.add_row().cells
+                cells[0].text = str(r["city"])
+                ecmwf_mae = r.get("ECMWF_mae_c")
+                gfs_mae = r.get("GFS_mae_c")
+                cells[1].text = f"{ecmwf_mae:.1f}" if pd.notnull(ecmwf_mae) else "n/a"
+                cells[2].text = f"{gfs_mae:.1f}" if pd.notnull(gfs_mae) else "n/a"
 
     doc.add_heading("Insights", level=2)
     for insight in insights:
