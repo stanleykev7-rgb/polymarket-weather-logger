@@ -11,7 +11,33 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-from data_utils import compute_lead_time_hours, load_combined_log, resolve_write_target
+from data_utils import compute_hours_to_resolution, compute_lead_time_hours, load_combined_log, resolve_write_target
+
+# --- NATIONAL MODELS (schema v4, 2026-08) --------------------------------
+# City-specific national weather service models, matched to the city each
+# was actually built to forecast -- the argument being that a country's
+# own model may out-perform a "generalist" global model on its own turf.
+# Confirmed live/working identifiers via Open-Meteo's docs pages (checked
+# 2026-08): JMA (jma_seamless), UKMO (ukmo_seamless), Météo-France
+# (meteofrance_seamless), all requested in the SAME forecast API call as
+# ECMWF/GFS/ICON, so no extra network round-trip.
+#
+# Deliberately NOT included, despite being the "obvious" match:
+#   - KMA for Seoul: Open-Meteo's own docs state KMA discontinued their
+#     UM-based models in March 2026 and "KMA data updates are currently
+#     suspended" while they migrate to a new source. Wiring this up now
+#     would silently return stale/no data.
+#   - CMA for Shanghai/Qingdao/Guangzhou/Shenzhen: Open-Meteo's docs
+#     state CMA's open-data service has been "heavily overloaded...
+#     making it nearly impossible to download forecasts reliably."
+# Both can be added later once Open-Meteo's own pages stop flagging them
+# as degraded -- check https://open-meteo.com/en/docs/kma-api and
+# https://open-meteo.com/en/docs/cma-api before re-enabling.
+NATIONAL_MODELS = {
+    "Tokyo": ("jma_seamless", "JMA"),
+    "London": ("ukmo_seamless", "UKMO"),
+    "Paris": ("meteofrance_seamless", "MeteoFrance"),
+}
 
 # 1. CITIES CONFIGURATION
 CITIES = {
@@ -166,6 +192,13 @@ CSV_FILE = "polymarket_weather_live_log.csv"
 # Same column-count-changed-so-route-to-a-new-file mechanism applies --
 # this will land in polymarket_weather_live_log_v3.csv once the first
 # row with this column set is written.
+# --- SCHEMA v4 (2026-08, later same day) --------------------------------
+# Added city-matched national model support (JMA/Tokyo, UKMO/London,
+# Météo-France/Paris -- see NATIONAL_MODELS) plus hours_to_resolution,
+# a second lead-time framing measured to the END of the target local day
+# (when the outcome is actually decided) rather than its start. See
+# data_utils.compute_hours_to_resolution for why this is a distinct,
+# deliberately separate field from lead_time_hours.
 CSV_COLUMNS = [
     "timestamp_utc",
     "city",
@@ -173,11 +206,14 @@ CSV_COLUMNS = [
     "ecmwf_max_c",
     "gfs_max_c",
     "icon_max_c",
+    "national_model_name",
+    "national_model_max_c",
     "predicted_bucket",  # legacy meaning preserved: == ecmwf_bucket
     "polymarket_price",  # legacy meaning preserved: == ecmwf_bucket_probability
     "all_bucket_prices",
     "snapshot_id",
     "lead_time_hours",
+    "hours_to_resolution",
     "model_spread_c",
     "abs_model_spread_c",
     "ecmwf_run_utc",
@@ -192,11 +228,14 @@ CSV_COLUMNS = [
     "gfs_bucket_probability",
     "icon_bucket",
     "icon_bucket_probability",
+    "national_model_bucket",
+    "national_model_bucket_probability",
     "market_modal_bucket",
     "market_modal_bucket_price",
     "ecmwf_change_c",
     "gfs_change_c",
     "icon_change_c",
+    "national_model_change_c",
     "market_implied_change_c",
     "data_quality",
 ]
@@ -226,15 +265,23 @@ def create_resilient_session(retries=3, backoff_factor=1):
   return session
 
 
-def get_weather_forecast(lat, lon, tz, max_retries=3):
-  # Third model added 2026-08: DWD ICON ("dwd_icon_seamless" -- DWD's
-  # global ICON model, ~11km, blended with higher-resolution ICON EU/D2
-  # near Europe where available; sometimes referred to as "ICON13" from
-  # its older 13km global resolution). Requested in the SAME API call as
-  # ECMWF/GFS, so this adds no extra network round-trip.
+def get_weather_forecast(lat, lon, tz, max_retries=3, national_model_id=None):
+  # Third model (ICON) added 2026-08: DWD ICON ("dwd_icon_seamless" --
+  # DWD's global ICON model, ~11km, blended with higher-resolution ICON
+  # EU/D2 near Europe where available; sometimes referred to as
+  # "ICON13" from its older 13km global resolution).
+  #
+  # Optional 4th model (national_model_id, schema v4): a city-matched
+  # national weather service model (JMA/UKMO/Météo-France -- see
+  # NATIONAL_MODELS). Passed as an extra comma-joined model id so it's
+  # requested in this SAME API call, no extra network round-trip.
+  models = "ecmwf_ifs025,gfs_seamless,dwd_icon_seamless"
+  if national_model_id:
+    models += f",{national_model_id}"
+
   url = (
       f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-      f"&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless,dwd_icon_seamless&timezone={tz}"
+      f"&daily=temperature_2m_max&models={models}&timezone={tz}"
   )
   session = create_resilient_session(retries=max_retries)
 
@@ -246,16 +293,21 @@ def get_weather_forecast(lat, lon, tz, max_retries=3):
         if "daily" in data and "time" in data["daily"]:
           forecasts = {}
           daily = data["daily"]
+          n = len(daily["time"])
+          national_key = f"temperature_2m_max_{national_model_id}" if national_model_id else None
           for idx, date_str in enumerate(daily["time"]):
             forecasts[date_str] = {
                 "ecmwf": daily["temperature_2m_max_ecmwf_ifs025"][idx],
                 "gfs": daily["temperature_2m_max_gfs_seamless"][idx],
                 # .get(...) with a fallback list, not a plain index,
-                # so a temporary gap in ICON's response (a field this
-                # API has occasionally omitted for some locations)
-                # degrades to a missing value instead of crashing the
-                # whole snapshot for ECMWF/GFS too.
-                "icon": daily.get("temperature_2m_max_dwd_icon_seamless", [None] * len(daily["time"]))[idx],
+                # so a temporary gap in a model's response (an issue
+                # this API has occasionally had for some
+                # locations/models) degrades to a missing value
+                # instead of crashing the whole snapshot.
+                "icon": daily.get("temperature_2m_max_dwd_icon_seamless", [None] * n)[idx],
+                "national": (
+                    daily.get(national_key, [None] * n)[idx] if national_key else None
+                ),
             }
           return forecasts
 
@@ -295,8 +347,21 @@ def parse_event_markets(event_data):
 
 
 def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
+  """Returns a list of (target_date_str, prices_dict) for EVERY candidate
+  date that has an active, priced market -- not just the first one found.
+
+  FIX (2026-08): previously this returned on the first match and
+  stopped, so a single polling cycle only ever logged the single
+  soonest open market for a city and silently never even checked later
+  dates (e.g. Polymarket having Aug 16/17/18 all open simultaneously
+  would only ever produce an Aug 16 row, every cycle, until Aug 16
+  closed). Now it checks every candidate date and returns all matches,
+  so all currently-open markets for a city get logged in the same
+  cycle.
+  """
   session = create_resilient_session()
   slug_tag = city_info["slug_tag"]
+  found = []
 
   for target_date_str in forecast_dates:
     dt = datetime.strptime(target_date_str, "%Y-%m-%d")
@@ -308,6 +373,7 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
         f"highest-temperature-in-{slug_tag}-on-{month_name}-{day_num}-{dt.year}",
     ]
 
+    matched_prices = None
     for event_slug in patterns:
       url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
       try:
@@ -317,40 +383,43 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
           if event and not event.get("closed", False):
             prices = parse_event_markets(event)
             if prices:
-              return target_date_str, prices
+              matched_prices = prices
+              break
       except Exception:
         pass
 
-    search_query = city_info.get(
-        "search_term", f"Highest temperature in {city_name}"
-    )
-    url_search = "https://gamma-api.polymarket.com/events"
-    try:
-      res = session.get(
-          url_search,
-          params={"active": "true", "closed": "false", "q": search_query},
-          timeout=10,
+    if matched_prices is None:
+      search_query = city_info.get(
+          "search_term", f"Highest temperature in {city_name}"
       )
-      if res.status_code == 200:
-        events = res.json()
-        if isinstance(events, list):
-          for event in events:
-            title = event.get("title", "").lower()
-            if (
-                "temperature" in title
-                and month_name in title
-                and str(day_num) in title
-            ):
-              prices = parse_event_markets(event)
-              if prices:
-                return target_date_str, prices
-    except Exception:
-      pass
+      url_search = "https://gamma-api.polymarket.com/events"
+      try:
+        res = session.get(
+            url_search,
+            params={"active": "true", "closed": "false", "q": search_query},
+            timeout=10,
+        )
+        if res.status_code == 200:
+          events = res.json()
+          if isinstance(events, list):
+            for event in events:
+              title = event.get("title", "").lower()
+              if (
+                  "temperature" in title
+                  and month_name in title
+                  and str(day_num) in title
+              ):
+                prices = parse_event_markets(event)
+                if prices:
+                  matched_prices = prices
+                  break
+      except Exception:
+        pass
 
-  default_target = (
-      forecast_dates[1] if len(forecast_dates) > 1 else forecast_dates[0]
-  )
-  return default_target, {}
+    if matched_prices:
+      found.append((target_date_str, matched_prices))
+
+  return found
 
 
 def parse_bucket_midpoint(bucket_str):
@@ -464,26 +533,34 @@ def compute_market_implied_temp(prices_dict):
 
 
 def load_previous_snapshot():
-  """Loads the most recent row per city across ALL schema versions of
-  the log (see data_utils.load_combined_log), so 'previous observation'
-  comparisons (ecmwf_change_c etc.) aren't blind to rows written under
-  an older or newer schema file.
+  """Loads the most recent row per (city, target_date) pair across ALL
+  schema versions of the log (see data_utils.load_combined_log), so
+  'previous observation' comparisons (ecmwf_change_c etc.) aren't blind
+  to rows written under an older or newer schema file.
+
+  FIX (2026-08): previously keyed by city ALONE. Now that a single
+  polling cycle can log multiple simultaneously-open target dates for
+  the same city (see get_polymarket_prices_multi_date fix), keying by
+  city alone meant "change vs previous" could silently compare two
+  DIFFERENT target dates' forecasts against each other (e.g. this
+  cycle's Aug 18 forecast minus last cycle's Aug 16 forecast) rather
+  than the same day's forecast an hour apart. Keying by (city,
+  target_date) makes this comparison mean what it's supposed to mean.
   """
   try:
     df = load_combined_log(CSV_FILE)
-    if df.empty or "city" not in df.columns:
+    if df.empty or "city" not in df.columns or "target_date" not in df.columns:
       return {}
-    # Sort by timestamp so "last" is chronologically last, not just
-    # last-in-file (matters once multiple schema-version files exist).
     if "timestamp_utc" in df.columns:
       df = df.sort_values("timestamp_utc")
     last_records = {}
-    for city, group in df.groupby("city"):
+    for (city, target_date), group in df.groupby(["city", "target_date"]):
       last_row = group.iloc[-1]
-      last_records[city] = {
+      last_records[(city, target_date)] = {
           "ecmwf_max_c": last_row.get("ecmwf_max_c"),
           "gfs_max_c": last_row.get("gfs_max_c"),
           "icon_max_c": last_row.get("icon_max_c"),
+          "national_model_max_c": last_row.get("national_model_max_c"),
           "market_implied_temp_c": last_row.get("market_implied_temp_c"),
       }
     return last_records
@@ -501,190 +578,245 @@ def log_snapshot():
 
   for city_name, info in CITIES.items():
     time.sleep(0.3)
-    quality_issues = []
+    base_quality_issues = []
     unit = info.get("unit", "C")
 
     # 1. Fetch Local Weather Forecasts (°C)
+    national_model_id, national_model_name = NATIONAL_MODELS.get(city_name, (None, None))
     try:
       forecasts_by_date = get_weather_forecast(
-          info["lat"], info["lon"], info["tz"]
+          info["lat"], info["lon"], info["tz"], national_model_id=national_model_id
       )
-      candidate_dates = sorted(list(forecasts_by_date.keys()))[:3]
+      # FIX (2026-08): previously capped at [:3], which silently missed
+      # Polymarket markets open further out (observed: Polymarket had
+      # Aug 18 open while this only ever checked up to 3 days ahead).
+      # Now uses every date Open-Meteo actually returned.
+      candidate_dates = sorted(list(forecasts_by_date.keys()))
     except Exception:
       forecasts_by_date = {}
       candidate_dates = [now_dt.strftime("%Y-%m-%d")]
-      quality_issues.append("WEATHER_FETCH_FAILED")
+      base_quality_issues.append("WEATHER_FETCH_FAILED")
 
-    # 2. Fetch Active Market Prices
-    target_date, poly_prices = get_polymarket_prices_multi_date(
-        city_name, info, candidate_dates
-    )
+    # 2. Fetch ALL Active Market Prices for every candidate date (FIX
+    # 2026-08: previously stopped at the first match, so simultaneously
+    # open markets for later dates were never logged at all -- see
+    # get_polymarket_prices_multi_date docstring).
+    matches = get_polymarket_prices_multi_date(city_name, info, candidate_dates)
 
-    day_weather = forecasts_by_date.get(target_date, {})
-    ecmwf_t_c = day_weather.get("ecmwf")
-    gfs_t_c = day_weather.get("gfs")
-    icon_t_c = day_weather.get("icon")
+    if not matches:
+      # No active market found for ANY candidate date this cycle --
+      # still log one row (with empty prices) so the absence is visible
+      # in data_quality, instead of silently producing nothing for
+      # this city.
+      default_target = (
+          candidate_dates[1] if len(candidate_dates) > 1 else candidate_dates[0]
+      )
+      matches = [(default_target, {})]
 
-    # Convert forecast to native unit (°F for US, °C for others)
-    ecmwf_native = c_to_f(ecmwf_t_c) if unit == "F" else ecmwf_t_c
-    gfs_native = c_to_f(gfs_t_c) if unit == "F" else gfs_t_c
-    icon_native = c_to_f(icon_t_c) if unit == "F" else icon_t_c
+    for target_date, poly_prices in matches:
+      quality_issues = list(base_quality_issues)
 
-    if not poly_prices:
-      quality_issues.append("MISSING_POLYMARKET_PRICES")
+      day_weather = forecasts_by_date.get(target_date, {})
+      ecmwf_t_c = day_weather.get("ecmwf")
+      gfs_t_c = day_weather.get("gfs")
+      icon_t_c = day_weather.get("icon")
+      national_t_c = day_weather.get("national")
 
-    # 3. Lead Time Calculation (city-LOCAL midnight, not UTC midnight --
-    # see data_utils.compute_lead_time_hours / audit finding HIGH-1)
-    lead_time_hours = compute_lead_time_hours(now_dt, target_date, info["tz"])
+      # Convert forecast to native unit (°F for US, °C for others)
+      ecmwf_native = c_to_f(ecmwf_t_c) if unit == "F" else ecmwf_t_c
+      gfs_native = c_to_f(gfs_t_c) if unit == "F" else gfs_t_c
+      icon_native = c_to_f(icon_t_c) if unit == "F" else icon_t_c
+      national_native = c_to_f(national_t_c) if unit == "F" else national_t_c
 
-    # 4. Spreads & Bucket Matching
-    # NOTE: model_spread_c / abs_model_spread_c stay strictly ECMWF vs
-    # GFS (unchanged meaning, for continuity with every existing row).
-    # ICON doesn't get its own spread field yet -- its bucket/hit-rate
-    # comparison below is enough to evaluate it independently; add a
-    # dedicated icon_vs_ecmwf_c-style field later if that 3-way spread
-    # becomes useful for analysis.
-    model_spread_c = None
-    abs_model_spread_c = None
-    if ecmwf_t_c is not None and gfs_t_c is not None:
-      model_spread_c = round(ecmwf_t_c - gfs_t_c, 2)
-      abs_model_spread_c = round(abs(model_spread_c), 2)
+      if not poly_prices:
+        quality_issues.append("MISSING_POLYMARKET_PRICES")
 
-    ecmwf_bucket, ecmwf_bucket_prob, ecmwf_valid = match_temp_to_bucket(
-        ecmwf_native, poly_prices
-    )
-    if ecmwf_t_c is not None and poly_prices and not ecmwf_valid:
-      quality_issues.append("ECMWF_BUCKET_MAPPING_AMBIGUOUS")
+      # 3. Lead Time Calculation (city-LOCAL midnight, not UTC midnight --
+      # see data_utils.compute_lead_time_hours / audit finding HIGH-1).
+      # Two DISTINCT framings, deliberately both kept -- see the
+      # docstrings on each in data_utils.py:
+      #   lead_time_hours: hours to the START of the target local day
+      #     (standard NWP verification convention).
+      #   hours_to_resolution: hours to the END of the target local day
+      #     (when the market's outcome is actually decided).
+      lead_time_hours = compute_lead_time_hours(now_dt, target_date, info["tz"])
+      hours_to_resolution = compute_hours_to_resolution(now_dt, target_date, info["tz"])
 
-    gfs_bucket, gfs_bucket_prob, gfs_valid = match_temp_to_bucket(
-        gfs_native, poly_prices
-    )
-    if gfs_t_c is not None and poly_prices and not gfs_valid:
-      quality_issues.append("GFS_BUCKET_MAPPING_AMBIGUOUS")
+      # 4. Spreads & Bucket Matching
+      # NOTE: model_spread_c / abs_model_spread_c stay strictly ECMWF vs
+      # GFS (unchanged meaning, for continuity with every existing row).
+      # ICON/national model don't get their own spread field yet -- their
+      # bucket/hit-rate comparison below is enough to evaluate them
+      # independently.
+      model_spread_c = None
+      abs_model_spread_c = None
+      if ecmwf_t_c is not None and gfs_t_c is not None:
+        model_spread_c = round(ecmwf_t_c - gfs_t_c, 2)
+        abs_model_spread_c = round(abs(model_spread_c), 2)
 
-    icon_bucket, icon_bucket_prob, icon_valid = match_temp_to_bucket(
-        icon_native, poly_prices
-    )
-    if icon_t_c is not None and poly_prices and not icon_valid:
-      quality_issues.append("ICON_BUCKET_MAPPING_AMBIGUOUS")
-    if icon_t_c is None:
-      quality_issues.append("ICON_FORECAST_MISSING")
+      ecmwf_bucket, ecmwf_bucket_prob, ecmwf_valid = match_temp_to_bucket(
+          ecmwf_native, poly_prices
+      )
+      if ecmwf_t_c is not None and poly_prices and not ecmwf_valid:
+        quality_issues.append("ECMWF_BUCKET_MAPPING_AMBIGUOUS")
 
-    # NOTE (schema v2): predicted_bucket/polymarket_price keep their
-    # ORIGINAL as-implemented meaning (ECMWF-matched bucket) for
-    # continuity with every historical row. See CSV_COLUMNS comment.
-    predicted_bucket = ecmwf_bucket
-    polymarket_price = ecmwf_bucket_prob
+      gfs_bucket, gfs_bucket_prob, gfs_valid = match_temp_to_bucket(
+          gfs_native, poly_prices
+      )
+      if gfs_t_c is not None and poly_prices and not gfs_valid:
+        quality_issues.append("GFS_BUCKET_MAPPING_AMBIGUOUS")
 
-    # market_modal_bucket: the market's ACTUAL current favorite bucket
-    # (highest priced), independent of either model. This is what
-    # "predicted_bucket" was originally intended to mean; it now has
-    # its own honestly-named field instead of overloading an existing
-    # column.
-    market_modal_bucket = None
-    market_modal_bucket_price = None
-    if poly_prices:
-      market_modal_bucket = max(poly_prices, key=poly_prices.get)
-      market_modal_bucket_price = poly_prices[market_modal_bucket]
+      icon_bucket, icon_bucket_prob, icon_valid = match_temp_to_bucket(
+          icon_native, poly_prices
+      )
+      if icon_t_c is not None and poly_prices and not icon_valid:
+        quality_issues.append("ICON_BUCKET_MAPPING_AMBIGUOUS")
+      if icon_t_c is None:
+        quality_issues.append("ICON_FORECAST_MISSING")
 
-    # 5. Market Implied Temperature (Standardized to °C for CSV)
-    mkt_implied_native, sum_prob, implied_used_approx = (
-        compute_market_implied_temp(poly_prices)
-    )
-    mkt_implied_c = (
-        f_to_c(mkt_implied_native)
-        if (unit == "F" and mkt_implied_native is not None)
-        else mkt_implied_native
-    )
-    if mkt_implied_c is not None:
-      mkt_implied_c = round(mkt_implied_c, 2)
+      # National model bucket matching -- only meaningful for cities with
+      # a matched model (see NATIONAL_MODELS). No "missing" quality flag
+      # here for the other 11 cities, since not having one is expected,
+      # not an error.
+      national_bucket, national_bucket_prob, national_valid = match_temp_to_bucket(
+          national_native, poly_prices
+      )
+      if national_model_id and national_t_c is not None and poly_prices and not national_valid:
+        quality_issues.append("NATIONAL_MODEL_BUCKET_MAPPING_AMBIGUOUS")
+      if national_model_id and national_t_c is None:
+        quality_issues.append("NATIONAL_MODEL_FORECAST_MISSING")
 
-    if poly_prices and sum_prob < 0.50:
-      quality_issues.append("LOW_TOTAL_MARKET_PROBABILITY")
+      # NOTE (schema v2): predicted_bucket/polymarket_price keep their
+      # ORIGINAL as-implemented meaning (ECMWF-matched bucket) for
+      # continuity with every historical row. See CSV_COLUMNS comment.
+      predicted_bucket = ecmwf_bucket
+      polymarket_price = ecmwf_bucket_prob
 
-    mkt_vs_ecmwf = (
-        round(mkt_implied_c - ecmwf_t_c, 2)
-        if (mkt_implied_c is not None and ecmwf_t_c is not None)
-        else None
-    )
-    mkt_vs_gfs = (
-        round(mkt_implied_c - gfs_t_c, 2)
-        if (mkt_implied_c is not None and gfs_t_c is not None)
-        else None
-    )
+      # market_modal_bucket: the market's ACTUAL current favorite bucket
+      # (highest priced), independent of either model. This is what
+      # "predicted_bucket" was originally intended to mean; it now has
+      # its own honestly-named field instead of overloading an existing
+      # column.
+      market_modal_bucket = None
+      market_modal_bucket_price = None
+      if poly_prices:
+        market_modal_bucket = max(poly_prices, key=poly_prices.get)
+        market_modal_bucket_price = poly_prices[market_modal_bucket]
 
-    # 6. Inter-run Deltas
-    city_prev = prev_data.get(city_name, {})
-    ecmwf_change = (
-        round(ecmwf_t_c - city_prev["ecmwf_max_c"], 2)
-        if (
-            ecmwf_t_c is not None
-            and pd.notnull(city_prev.get("ecmwf_max_c"))
-        )
-        else None
-    )
-    gfs_change = (
-        round(gfs_t_c - city_prev["gfs_max_c"], 2)
-        if (gfs_t_c is not None and pd.notnull(city_prev.get("gfs_max_c")))
-        else None
-    )
-    icon_change = (
-        round(icon_t_c - city_prev["icon_max_c"], 2)
-        if (icon_t_c is not None and pd.notnull(city_prev.get("icon_max_c")))
-        else None
-    )
-    mkt_change = (
-        round(mkt_implied_c - city_prev["market_implied_temp_c"], 2)
-        if (
-            mkt_implied_c is not None
-            and pd.notnull(city_prev.get("market_implied_temp_c"))
-        )
-        else None
-    )
+      # 5. Market Implied Temperature (Standardized to °C for CSV)
+      mkt_implied_native, sum_prob, implied_used_approx = (
+          compute_market_implied_temp(poly_prices)
+      )
+      mkt_implied_c = (
+          f_to_c(mkt_implied_native)
+          if (unit == "F" and mkt_implied_native is not None)
+          else mkt_implied_native
+      )
+      if mkt_implied_c is not None:
+        mkt_implied_c = round(mkt_implied_c, 2)
 
-    if implied_used_approx:
-      quality_issues.append("IMPLIED_TEMP_USED_OPEN_BUCKET_APPROX")
-    if poly_prices and market_modal_bucket is None:
-      quality_issues.append("MODAL_BUCKET_UNRESOLVED")
+      if poly_prices and sum_prob < 0.50:
+        quality_issues.append("LOW_TOTAL_MARKET_PROBABILITY")
 
-    # 7. Construct Record
-    all_bucket_json = json.dumps(poly_prices, ensure_ascii=False)
-    data_quality = "OK" if not quality_issues else "|".join(quality_issues)
+      mkt_vs_ecmwf = (
+          round(mkt_implied_c - ecmwf_t_c, 2)
+          if (mkt_implied_c is not None and ecmwf_t_c is not None)
+          else None
+      )
+      mkt_vs_gfs = (
+          round(mkt_implied_c - gfs_t_c, 2)
+          if (mkt_implied_c is not None and gfs_t_c is not None)
+          else None
+      )
 
-    records.append({
-        "timestamp_utc": now_utc_str,
-        "city": city_name,
-        "target_date": target_date,
-        "ecmwf_max_c": ecmwf_t_c,
-        "gfs_max_c": gfs_t_c,
-        "icon_max_c": icon_t_c,
-        "predicted_bucket": predicted_bucket,  # legacy meaning: == ecmwf_bucket
-        "polymarket_price": polymarket_price,  # legacy meaning: == ecmwf_bucket_probability
-        "all_bucket_prices": all_bucket_json,
-        "snapshot_id": snapshot_id,
-        "lead_time_hours": lead_time_hours,
-        "model_spread_c": model_spread_c,
-        "abs_model_spread_c": abs_model_spread_c,
-        "ecmwf_run_utc": None,
-        "gfs_run_utc": None,
-        "market_implied_temp_c": mkt_implied_c,
-        "market_implied_temp_used_open_bucket_approx": implied_used_approx,
-        "market_vs_ecmwf_c": mkt_vs_ecmwf,
-        "market_vs_gfs_c": mkt_vs_gfs,
-        "ecmwf_bucket": ecmwf_bucket,
-        "ecmwf_bucket_probability": ecmwf_bucket_prob,
-        "gfs_bucket": gfs_bucket,
-        "gfs_bucket_probability": gfs_bucket_prob,
-        "icon_bucket": icon_bucket,
-        "icon_bucket_probability": icon_bucket_prob,
-        "market_modal_bucket": market_modal_bucket,
-        "market_modal_bucket_price": market_modal_bucket_price,
-        "ecmwf_change_c": ecmwf_change,
-        "gfs_change_c": gfs_change,
-        "icon_change_c": icon_change,
-        "market_implied_change_c": mkt_change,
-        "data_quality": data_quality,
-    })
+      # 6. Inter-run Deltas
+      # FIX (2026-08): keyed by (city, target_date), not city alone --
+      # see load_previous_snapshot docstring for why. Without this, a
+      # city with multiple simultaneously-open target dates could have
+      # its "change vs previous" computed against a DIFFERENT date's
+      # forecast.
+      city_prev = prev_data.get((city_name, target_date), {})
+      ecmwf_change = (
+          round(ecmwf_t_c - city_prev["ecmwf_max_c"], 2)
+          if (
+              ecmwf_t_c is not None
+              and pd.notnull(city_prev.get("ecmwf_max_c"))
+          )
+          else None
+      )
+      gfs_change = (
+          round(gfs_t_c - city_prev["gfs_max_c"], 2)
+          if (gfs_t_c is not None and pd.notnull(city_prev.get("gfs_max_c")))
+          else None
+      )
+      icon_change = (
+          round(icon_t_c - city_prev["icon_max_c"], 2)
+          if (icon_t_c is not None and pd.notnull(city_prev.get("icon_max_c")))
+          else None
+      )
+      national_change = (
+          round(national_t_c - city_prev["national_model_max_c"], 2)
+          if (national_t_c is not None and pd.notnull(city_prev.get("national_model_max_c")))
+          else None
+      )
+      mkt_change = (
+          round(mkt_implied_c - city_prev["market_implied_temp_c"], 2)
+          if (
+              mkt_implied_c is not None
+              and pd.notnull(city_prev.get("market_implied_temp_c"))
+          )
+          else None
+      )
+
+      if implied_used_approx:
+        quality_issues.append("IMPLIED_TEMP_USED_OPEN_BUCKET_APPROX")
+      if poly_prices and market_modal_bucket is None:
+        quality_issues.append("MODAL_BUCKET_UNRESOLVED")
+
+      # 7. Construct Record
+      all_bucket_json = json.dumps(poly_prices, ensure_ascii=False)
+      data_quality = "OK" if not quality_issues else "|".join(quality_issues)
+
+      records.append({
+          "timestamp_utc": now_utc_str,
+          "city": city_name,
+          "target_date": target_date,
+          "ecmwf_max_c": ecmwf_t_c,
+          "gfs_max_c": gfs_t_c,
+          "icon_max_c": icon_t_c,
+          "national_model_name": national_model_name,
+          "national_model_max_c": national_t_c,
+          "predicted_bucket": predicted_bucket,  # legacy meaning: == ecmwf_bucket
+          "polymarket_price": polymarket_price,  # legacy meaning: == ecmwf_bucket_probability
+          "all_bucket_prices": all_bucket_json,
+          "snapshot_id": snapshot_id,
+          "lead_time_hours": lead_time_hours,
+          "hours_to_resolution": hours_to_resolution,
+          "model_spread_c": model_spread_c,
+          "abs_model_spread_c": abs_model_spread_c,
+          "ecmwf_run_utc": None,
+          "gfs_run_utc": None,
+          "market_implied_temp_c": mkt_implied_c,
+          "market_implied_temp_used_open_bucket_approx": implied_used_approx,
+          "market_vs_ecmwf_c": mkt_vs_ecmwf,
+          "market_vs_gfs_c": mkt_vs_gfs,
+          "ecmwf_bucket": ecmwf_bucket,
+          "ecmwf_bucket_probability": ecmwf_bucket_prob,
+          "gfs_bucket": gfs_bucket,
+          "gfs_bucket_probability": gfs_bucket_prob,
+          "icon_bucket": icon_bucket,
+          "icon_bucket_probability": icon_bucket_prob,
+          "national_model_bucket": national_bucket,
+          "national_model_bucket_probability": national_bucket_prob,
+          "market_modal_bucket": market_modal_bucket,
+          "market_modal_bucket_price": market_modal_bucket_price,
+          "ecmwf_change_c": ecmwf_change,
+          "gfs_change_c": gfs_change,
+          "icon_change_c": icon_change,
+          "national_model_change_c": national_change,
+          "market_implied_change_c": mkt_change,
+          "data_quality": data_quality,
+      })
 
   if records:
     df = pd.DataFrame(records, columns=CSV_COLUMNS)

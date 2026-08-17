@@ -149,11 +149,16 @@ else:
         "icon_max_c": "ICON (°C)",
         "icon_bucket": "ICON Bucket",
         "icon_bucket_probability": "Mkt Price of ICON Bucket",
+        "national_model_name": "National Model",
+        "national_model_max_c": "National Model (°C)",
+        "national_model_bucket": "National Model Bucket",
+        "national_model_bucket_probability": "Mkt Price of National Model Bucket",
         "model_spread_c": "ECMWF-GFS Spread (°C)",
         "market_modal_bucket": "Market Favorite Bucket",
         "market_modal_bucket_price": "Favorite Bucket Price",
         "market_implied_temp_c": "Market Implied Temp (°C)",
-        "lead_time_hours": "Lead Time (h)",
+        "lead_time_hours": "Lead Time (h, to day start)",
+        "hours_to_resolution": "Hours to Resolution (to day end)",
         "data_quality": "Data Quality",
     }
     available = [c for c in display_cols if c in latest.columns]
@@ -166,16 +171,26 @@ else:
             "ECMWF (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "GFS (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "ICON (°C)": st.column_config.NumberColumn(format="%.1f °C"),
+            "National Model (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "ECMWF-GFS Spread (°C)": st.column_config.NumberColumn(format="%+.1f °C"),
             "Market Implied Temp (°C)": st.column_config.NumberColumn(format="%.1f °C"),
             "Mkt Price of ECMWF Bucket": st.column_config.NumberColumn(format="%.3f"),
             "Mkt Price of GFS Bucket": st.column_config.NumberColumn(format="%.3f"),
             "Mkt Price of ICON Bucket": st.column_config.NumberColumn(format="%.3f"),
+            "Mkt Price of National Model Bucket": st.column_config.NumberColumn(format="%.3f"),
             "Favorite Bucket Price": st.column_config.NumberColumn(format="%.3f"),
-            "Lead Time (h)": st.column_config.NumberColumn(format="%.1f"),
+            "Lead Time (h, to day start)": st.column_config.NumberColumn(format="%.1f"),
+            "Hours to Resolution (to day end)": st.column_config.NumberColumn(format="%.1f"),
         },
         use_container_width=True,
         hide_index=True,
+    )
+    st.caption(
+        "**Lead Time** = hours before the target's LOCAL day begins (negative = day already started). "
+        "**Hours to Resolution** = hours before that day ENDS, i.e. when the market's outcome is actually "
+        "decided — a different, complementary measure. National Model columns are populated only for "
+        "Tokyo (JMA), London (UKMO), and Paris (Météo-France) — see SCHEMA.md for why other cities don't "
+        "have one yet."
     )
     if missing:
         st.caption(
@@ -286,7 +301,12 @@ else:
     else:
         st.caption("abs_model_spread_c not available for this data.")
 
-    st.subheader("Hit Rate by Lead Time")
+    st.subheader("Hit Rate by Lead Time (hours before the target day BEGINS)")
+    st.caption(
+        "Standard forecast-verification convention: how far ahead of the target "
+        "LOCAL day starting was this observation made. See the next chart for "
+        "the complementary 'time to resolution' view."
+    )
     if has_col(settled, "lead_time_hours"):
         lt_bins = [-float("inf"), 24, 48, 72, 168, float("inf")]
         lt_labels = ["<24h", "24–48h", "48–72h", "3–7d", "7d+"]
@@ -303,7 +323,7 @@ else:
             fig4 = px.bar(
                 by_lead, x="lead_bucket", y="mean",
                 text=by_lead["count"].apply(lambda c: f"n={c}"),
-                labels={"lead_bucket": "Lead Time", "mean": "ECMWF Hit Rate"},
+                labels={"lead_bucket": "Lead Time (to day start)", "mean": "ECMWF Hit Rate"},
                 title="Does ECMWF's bucket accuracy change with lead time?",
             )
             fig4.update_yaxes(tickformat=".0%")
@@ -312,6 +332,40 @@ else:
             st.caption("Not enough settled rows with lead time data yet.")
     else:
         st.caption("lead_time_hours not available for this data.")
+
+    st.subheader("Hit Rate by Time to Resolution (hours before the target day ENDS)")
+    st.caption(
+        "A DIFFERENT question from lead time above: how close was this "
+        "observation to the moment the day's actual outcome was fully decided. "
+        "A forecast made 6h before the day starts is ~30h before it ends — use "
+        "this chart (not the one above) to check whether accuracy sharpens in "
+        "the final hours before a market actually resolves."
+    )
+    if has_col(settled, "hours_to_resolution"):
+        rt_bins = [-float("inf"), 6, 24, 48, 96, float("inf")]
+        rt_labels = ["<6h", "6-24h", "24-48h", "2-4d", "4d+"]
+        settled["resolution_bucket"] = pd.cut(
+            settled["hours_to_resolution"], bins=rt_bins, labels=rt_labels
+        )
+        by_res = (
+            settled.dropna(subset=["resolution_bucket"])
+            .groupby("resolution_bucket", observed=True)["ecmwf_hit"]
+            .agg(["mean", "count"])
+            .reset_index()
+        )
+        if not by_res.empty:
+            fig4b = px.bar(
+                by_res, x="resolution_bucket", y="mean",
+                text=by_res["count"].apply(lambda c: f"n={c}"),
+                labels={"resolution_bucket": "Time to Resolution (to day end)", "mean": "ECMWF Hit Rate"},
+                title="Does ECMWF's bucket accuracy sharpen closer to resolution?",
+            )
+            fig4b.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig4b, use_container_width=True)
+        else:
+            st.caption("Not enough settled rows with resolution-time data yet.")
+    else:
+        st.caption("hours_to_resolution not available for this data (older schema rows).")
 
     st.subheader("Market Calibration: Priced Probability vs. Actual Win Rate")
     st.caption(
@@ -347,6 +401,60 @@ else:
             st.caption(f"Only {len(calib)} settled rows with a priced probability — need more data for a calibration curve.")
     else:
         st.caption("No bucket-price column available for calibration.")
+
+    st.subheader("🏆 Model Reliability by City")
+    st.caption(
+        "Which model has historically tracked each city's actual weather most "
+        "closely — the direct answer to \"should I trust ECMWF, GFS, ICON, or "
+        "this city's national model here?\" Needs at least 10 settled "
+        "observations for a city before naming a 'Best Model' — below that, "
+        "it's marked '—' rather than guessing from too little data."
+    )
+    city_perf = rb.compute_city_performance(df)
+    city_mae = rb.compute_city_temp_accuracy(df)
+    if city_perf.empty:
+        st.info("No settled data yet to compute per-city model reliability.")
+    else:
+        MIN_CITY_N = 10
+        display_perf = city_perf.copy()
+        display_perf["Best Model"] = display_perf.apply(
+            lambda r: r["best_model"] if r["n"] >= MIN_CITY_N and pd.notnull(r["best_model"]) else "—",
+            axis=1,
+        )
+        rate_cols = {f"{m}_hit_rate": f"{m} Hit Rate" for m in rb.MODEL_HIT_COLS}
+        perf_table = display_perf[["city", "n", *rate_cols.keys(), "Best Model"]].rename(
+            columns={"city": "City", "n": "Settled n", **rate_cols}
+        )
+        # Pre-multiply to percentage points (0-100) rather than relying on
+        # format-string percent-scaling behavior, which isn't consistent
+        # across Streamlit versions -- this way the displayed number is
+        # correct regardless.
+        for m in rb.MODEL_HIT_COLS:
+            col = f"{m} Hit Rate"
+            if col in perf_table.columns:
+                perf_table[col] = perf_table[col] * 100
+        st.dataframe(
+            perf_table,
+            column_config={
+                f"{m} Hit Rate": st.column_config.ProgressColumn(
+                    f"{m} Hit Rate", format="%.0f%%", min_value=0, max_value=100
+                ) for m in rb.MODEL_HIT_COLS
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+        if not city_mae.empty:
+            with st.expander("Temperature accuracy by city (°C mean absolute error)"):
+                st.caption(
+                    "Finer-grained than hit rate above — a city can narrowly miss "
+                    "its bucket every time (small error, low hit rate) or hit by "
+                    "chance with a forecast that was actually far off."
+                )
+                mae_cols = {c: c.replace("_mae_c", " MAE (°C)").replace("_", " ") for c in city_mae.columns if c.endswith("_mae_c")}
+                mae_table = city_mae[["city", "n", *mae_cols.keys()]].rename(
+                    columns={"city": "City", "n": "n", **mae_cols}
+                )
+                st.dataframe(mae_table, use_container_width=True, hide_index=True)
 
     with st.expander("Settled rows (raw)"):
         raw_cols = [c for c in [
@@ -389,10 +497,10 @@ st.divider()
 st.header("📄 Performance Report")
 st.caption(
     "Generates a day-by-day, lead-time-by-lead-time comparison of ECMWF, "
-    "GFS, and the market's own favorite bucket, as a downloadable PNG or "
-    "Word document you can share. Built from settled rows only "
-    "(same data as the Backtesting section above) -- descriptive, not a "
-    "trading recommendation."
+    "GFS, ICON, each city's national model (where matched), and the "
+    "market's own favorite bucket, as a downloadable PNG or Word document "
+    "you can share. Built from settled rows only (same data as the "
+    "Backtesting section above) -- descriptive, not a trading recommendation."
 )
 
 report_col1, report_col2 = st.columns(2)

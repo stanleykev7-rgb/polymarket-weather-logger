@@ -28,7 +28,17 @@ MODEL_HIT_COLS = {
     "ECMWF": "ecmwf_hit",
     "GFS": "gfs_hit",
     "ICON": "icon_hit",
+    "National Model": "national_model_hit",
     "Market Favorite": "market_favorite_hit",
+}
+
+# City-matched national models (schema v4) -- only Tokyo/London/Paris
+# have one currently; see weather_collector.py NATIONAL_MODELS for why
+# Seoul (KMA) and the Chinese cities (CMA) aren't included yet.
+NATIONAL_MODEL_BY_CITY = {
+    "Tokyo": "JMA",
+    "London": "UKMO",
+    "Paris": "MeteoFrance",
 }
 
 
@@ -76,22 +86,26 @@ def compute_daily_performance(df: pd.DataFrame, city: str | None = None) -> pd.D
     return out
 
 
-def compute_lead_time_performance(df: pd.DataFrame, city: str | None = None) -> pd.DataFrame:
-    """Hit rate for each model, binned by lead time at observation time."""
-    settled = _settled_subset(df, city)
-    if settled.empty or "lead_time_hours" not in settled.columns:
-        return pd.DataFrame(columns=["lead_bucket", "n"] + [f"{m}_hit_rate" for m in MODEL_HIT_COLS])
+RESOLUTION_TIME_BINS = [-float("inf"), 6, 24, 48, 96, float("inf")]
+RESOLUTION_TIME_LABELS = ["<6h", "6-24h", "24-48h", "2-4d", "4d+"]
+
+
+def _hit_rate_by_bin(
+    settled: pd.DataFrame, bin_col: str, bins: list, labels: list
+) -> pd.DataFrame:
+    """Shared binning logic for both lead-time framings below."""
+    if settled.empty or bin_col not in settled.columns:
+        return pd.DataFrame(columns=[bin_col + "_bucket", "n"] + [f"{m}_hit_rate" for m in MODEL_HIT_COLS])
 
     settled = settled.copy()
-    settled["lead_bucket"] = pd.cut(
-        settled["lead_time_hours"], bins=LEAD_TIME_BINS, labels=LEAD_TIME_LABELS
-    )
+    bucket_col = bin_col + "_bucket"
+    settled[bucket_col] = pd.cut(settled[bin_col], bins=bins, labels=labels)
     rows = []
-    for bucket in LEAD_TIME_LABELS:
-        group = settled[settled["lead_bucket"] == bucket]
+    for bucket in labels:
+        group = settled[settled[bucket_col] == bucket]
         if group.empty:
             continue
-        row = {"lead_bucket": bucket, "n": len(group)}
+        row = {bucket_col: bucket, "n": len(group)}
         for model, col in MODEL_HIT_COLS.items():
             if col in group.columns:
                 vals = group[col].dropna()
@@ -102,6 +116,31 @@ def compute_lead_time_performance(df: pd.DataFrame, city: str | None = None) -> 
                 row[f"{model}_n"] = 0
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def compute_lead_time_performance(df: pd.DataFrame, city: str | None = None) -> pd.DataFrame:
+    """Hit rate for each model, binned by hours to the START of the
+    target local day (standard NWP verification convention -- see
+    data_utils.compute_lead_time_hours). Column name kept as
+    'lead_bucket' for continuity with existing callers/report layout.
+    """
+    settled = _settled_subset(df, city)
+    result = _hit_rate_by_bin(settled, "lead_time_hours", LEAD_TIME_BINS, LEAD_TIME_LABELS)
+    return result.rename(columns={"lead_time_hours_bucket": "lead_bucket"})
+
+
+def compute_resolution_time_performance(df: pd.DataFrame, city: str | None = None) -> pd.DataFrame:
+    """Hit rate for each model, binned by hours to the END of the
+    target local day -- i.e. how close to the market actually resolving
+    (see data_utils.compute_hours_to_resolution). Deliberately a
+    SEPARATE analysis from compute_lead_time_performance above: a
+    forecast made far ahead of a day that's about to end soon is a
+    different situation from one made just before a day that's still
+    far off, and this distinguishes them.
+    """
+    settled = _settled_subset(df, city)
+    result = _hit_rate_by_bin(settled, "hours_to_resolution", RESOLUTION_TIME_BINS, RESOLUTION_TIME_LABELS)
+    return result.rename(columns={"hours_to_resolution_bucket": "resolution_bucket"})
 
 
 def compute_city_performance(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,7 +196,7 @@ def compute_city_temp_accuracy(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for city, group in known.groupby("city"):
         row = {"city": city, "n": len(group)}
-        for model, col in {"ECMWF": "ecmwf_max_c", "GFS": "gfs_max_c", "ICON": "icon_max_c"}.items():
+        for model, col in {"ECMWF": "ecmwf_max_c", "GFS": "gfs_max_c", "ICON": "icon_max_c", "National Model": "national_model_max_c"}.items():
             if col in group.columns:
                 diffs = (group[col] - group["actual_max_c_used"]).abs().dropna()
                 row[f"{model}_mae_c"] = diffs.mean() if len(diffs) else None
@@ -235,6 +274,27 @@ def generate_insights(
             "crowd' is simply right, independent of either model."
         )
 
+    # --- National (city-matched) model callout ---
+    scope_city = summary.get("scope")
+    if scope_city in NATIONAL_MODEL_BY_CITY:
+        national_name = NATIONAL_MODEL_BY_CITY[scope_city]
+        national_rate = summary.get("National Model_hit_rate")
+        ecmwf_rate = summary.get("ECMWF_hit_rate")
+        if national_rate is not None and ecmwf_rate is not None:
+            comparison = "outperformed" if national_rate > ecmwf_rate else (
+                "underperformed" if national_rate < ecmwf_rate else "matched"
+            )
+            insights.append(
+                f"{national_name} ({scope_city}'s national weather-service "
+                f"model) {comparison} ECMWF here: {national_rate*100:.0f}% vs "
+                f"{ecmwf_rate*100:.0f}% bucket hit rate."
+            )
+        elif national_rate is None:
+            insights.append(
+                f"{national_name} is {scope_city}'s matched national model, "
+                "but has no settled observations yet in this sample."
+            )
+
     # --- Per-city findings (only meaningful in the all-cities report) ---
     if city_perf is not None and not city_perf.empty:
         MIN_CITY_N = 10  # don't call out a city's "best model" on a handful of rows
@@ -292,7 +352,7 @@ def generate_insights(
 # ---------------------------------------------------------------------------
 # Chart helpers (shared between PNG and DOCX paths)
 # ---------------------------------------------------------------------------
-_COLORS = {"ECMWF": "#4C72B0", "GFS": "#DD8452", "ICON": "#8172B2", "Market Favorite": "#55A868"}
+_COLORS = {"ECMWF": "#4C72B0", "GFS": "#DD8452", "ICON": "#8172B2", "National Model": "#C44E52", "Market Favorite": "#55A868"}
 
 
 def _plot_hit_rate_by(ax, table: pd.DataFrame, x_col: str, title: str):
@@ -358,16 +418,17 @@ def build_png_report(df: pd.DataFrame, city: str | None = None) -> bytes:
     summary = compute_overall_summary(df, city)
     daily = compute_daily_performance(df, city)
     lead = compute_lead_time_performance(df, city)
+    resolution = compute_resolution_time_performance(df, city)
     city_perf = compute_city_performance(df) if city is None else None
     city_mae = compute_city_temp_accuracy(df) if city is None else None
     insights = generate_insights(summary, daily, lead, city_perf, city_mae)
 
     show_city_panel = city is None and city_perf is not None and not city_perf.empty
 
-    fig = plt.figure(figsize=(11, 11.5 if show_city_panel else 7.5))
-    n_rows = 4 if show_city_panel else 3
-    height_ratios = [1.0, 2.4, 2.6, 1.6] if show_city_panel else [0.7, 2.4, 1.1]
-    gs = fig.add_gridspec(n_rows, 2, height_ratios=height_ratios, hspace=0.7)
+    fig = plt.figure(figsize=(11, 14.5 if show_city_panel else 10.5))
+    n_rows = 5 if show_city_panel else 4
+    height_ratios = [1.0, 2.4, 2.4, 2.6, 1.6] if show_city_panel else [0.8, 2.4, 2.4, 1.3]
+    gs = fig.add_gridspec(n_rows, 2, height_ratios=height_ratios, hspace=0.8)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -388,15 +449,22 @@ def build_png_report(df: pd.DataFrame, city: str | None = None) -> bytes:
     ax1 = fig.add_subplot(gs[1, 0])
     _plot_hit_rate_by(ax1, daily, "target_date", "Hit Rate by Day")
     ax2 = fig.add_subplot(gs[1, 1])
-    _plot_hit_rate_by(ax2, lead, "lead_bucket", "Hit Rate by Lead Time")
+    _plot_hit_rate_by(ax2, lead, "lead_bucket", "Hit Rate by Lead Time\n(hours BEFORE the target day begins)")
 
-    insights_row = 2
+    ax3 = fig.add_subplot(gs[2, :])
+    _plot_hit_rate_by(
+        ax3, resolution, "resolution_bucket",
+        "Hit Rate by Time to Resolution (hours BEFORE the target day ENDS -- "
+        "when the outcome is actually decided; a different question from lead time above)"
+    )
+
+    next_row = 3
     if show_city_panel:
-        ax_city = fig.add_subplot(gs[2, :])
+        ax_city = fig.add_subplot(gs[3, :])
         _plot_city_comparison(ax_city, city_perf, "Hit Rate by City (which city each model tracks best)")
-        insights_row = 3
+        next_row = 4
 
-    ax_insights = fig.add_subplot(gs[insights_row, :])
+    ax_insights = fig.add_subplot(gs[next_row, :])
     ax_insights.axis("off")
     insight_text = "Insights:\n" + "\n".join(f"- {i}" for i in insights)
     ax_insights.text(0, 1.0, insight_text, fontsize=9, va="top", wrap=True)
@@ -428,6 +496,7 @@ def build_docx_report(df: pd.DataFrame, city: str | None = None) -> bytes:
     summary = compute_overall_summary(df, city)
     daily = compute_daily_performance(df, city)
     lead = compute_lead_time_performance(df, city)
+    resolution = compute_resolution_time_performance(df, city)
     city_perf = compute_city_performance(df) if city is None else None
     city_mae = compute_city_temp_accuracy(df) if city is None else None
     insights = generate_insights(summary, daily, lead, city_perf, city_mae)
@@ -488,7 +557,12 @@ def build_docx_report(df: pd.DataFrame, city: str | None = None) -> bytes:
                 cells[i].text = f"{rate*100:.0f}%" if pd.notnull(rate) else "n/a"
             cells[-1].text = str(int(r["n"]))
 
-    doc.add_heading("Hit Rate by Lead Time", level=2)
+    doc.add_heading("Hit Rate by Lead Time (hours before the target day BEGINS)", level=2)
+    doc.add_paragraph(
+        "Standard forecast-verification convention: how far ahead of the "
+        "target LOCAL day starting was this observation made. See 'Hit "
+        "Rate by Time to Resolution' below for the complementary view."
+    )
     if lead.empty:
         doc.add_paragraph("No settled data available for this scope yet.")
     else:
@@ -502,6 +576,33 @@ def build_docx_report(df: pd.DataFrame, city: str | None = None) -> bytes:
         for _, r in lead.iterrows():
             cells = t2.add_row().cells
             cells[0].text = str(r["lead_bucket"])
+            for i, model in enumerate(MODEL_HIT_COLS, start=1):
+                rate = r.get(f"{model}_hit_rate")
+                cells[i].text = f"{rate*100:.0f}%" if pd.notnull(rate) else "n/a"
+            cells[-1].text = str(int(r["n"]))
+
+    doc.add_heading("Hit Rate by Time to Resolution (hours before the target day ENDS)", level=2)
+    doc.add_paragraph(
+        "A DIFFERENT question from lead time above: how close was this "
+        "observation to the moment the day's actual max temperature -- "
+        "and therefore the market's outcome -- was fully decided. A "
+        "forecast made 6 hours before the day starts is ~30 hours before "
+        "the day ends; use this table (not the one above) to check "
+        "whether accuracy sharpens in the final hours before resolution."
+    )
+    if resolution.empty:
+        doc.add_paragraph("No settled data available for this scope yet.")
+    else:
+        t2b = doc.add_table(rows=1, cols=1 + len(MODEL_HIT_COLS) + 1)
+        t2b.style = "Light Grid Accent 1"
+        hdr = t2b.rows[0].cells
+        hdr[0].text = "Time to Resolution"
+        for i, model in enumerate(MODEL_HIT_COLS, start=1):
+            hdr[i].text = f"{model} Hit Rate"
+        hdr[-1].text = "n"
+        for _, r in resolution.iterrows():
+            cells = t2b.add_row().cells
+            cells[0].text = str(r["resolution_bucket"])
             for i, model in enumerate(MODEL_HIT_COLS, start=1):
                 rate = r.get(f"{model}_hit_rate")
                 cells[i].text = f"{rate*100:.0f}%" if pd.notnull(rate) else "n/a"

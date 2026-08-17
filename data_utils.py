@@ -23,7 +23,7 @@ from __future__ import annotations
 import glob
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -55,6 +55,21 @@ def compute_lead_time_hours(
     """Hours between `now_utc` and the start (local midnight) of the
     target local calendar day. Negative values mean the target day has
     already locally begun.
+
+    This is the STANDARD meteorological verification convention (lead
+    time = forecast issue time to the start of the valid period), and
+    is what every existing row's lead_time_hours has always meant --
+    kept unchanged for continuity.
+
+    IMPORTANT DISTINCTION (raised 2026-08): this measures distance to
+    the START of the target day, not to when the day's outcome is
+    actually decided. The daily max temperature -- and therefore the
+    market's resolution -- isn't final until the day ENDS. A forecast
+    made 6 hours before the target day starts is actually ~30 hours
+    before the day is over. If you want to study "does accuracy improve
+    in the final hours before resolution", use
+    compute_hours_to_resolution() below instead -- they answer
+    different questions and shouldn't be confused for each other.
     """
     if not target_date_str:
         return None
@@ -65,6 +80,34 @@ def compute_lead_time_hours(
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     return round((target_midnight_utc - now_utc).total_seconds() / 3600.0, 2)
+
+
+def compute_hours_to_resolution(
+    now_utc: datetime, target_date_str: str, iana_tz: str
+) -> float | None:
+    """Hours between `now_utc` and the END of the target local calendar
+    day (i.e. target local midnight + 24h) -- the point at which that
+    day's actual max temperature, and therefore the market outcome, is
+    fully decided. Negative values mean the day has already ended
+    locally.
+
+    This is the complementary "how close to the answer being locked in"
+    framing: a forecast made 6 hours before the target day STARTS is
+    ~30 hours before the day ENDS. Use this (not lead_time_hours) to
+    check whether model accuracy sharpens in the final hours before a
+    market actually resolves, independent of how far ahead the day
+    itself was.
+    """
+    if not target_date_str:
+        return None
+    try:
+        target_midnight_utc = local_midnight_to_utc(target_date_str, iana_tz)
+    except Exception:
+        return None
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    target_day_end_utc = target_midnight_utc + timedelta(hours=24)
+    return round((target_day_end_utc - now_utc).total_seconds() / 3600.0, 2)
 
 
 def local_day_open_meteo_timezone_param(iana_tz: str) -> str:

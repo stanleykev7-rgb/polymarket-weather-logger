@@ -172,3 +172,80 @@ same pattern: add it to the `models=` request, parse its
 columns, and it'll show up automatically in the report and dashboard
 since those already iterate generically over whatever models are
 present.
+
+## Schema v4: national models + hours_to_resolution (2026-08, later same day)
+
+**City-matched national models added**: JMA (Tokyo), UKMO (London),
+Météo-France (Paris) — confirmed live/working via Open-Meteo's own docs
+pages. Requested in the same API call as ECMWF/GFS/ICON, so no extra
+network round-trip.
+
+**Deliberately NOT added**, despite being the "obvious" match:
+- **KMA for Seoul**: Open-Meteo's docs state KMA discontinued their
+  UM-based models and updates are "currently suspended" during a
+  migration.
+- **CMA for Shanghai/Qingdao/Guangzhou/Shenzhen**: Open-Meteo's docs
+  state CMA's open-data service has been "heavily overloaded... making
+  it nearly impossible to download forecasts reliably."
+
+Both can be revisited once Open-Meteo's own status pages stop flagging
+them as degraded — check `https://open-meteo.com/en/docs/kma-api` and
+`https://open-meteo.com/en/docs/cma-api` before re-enabling.
+
+New columns: `national_model_name`, `national_model_max_c`,
+`national_model_bucket`, `national_model_bucket_probability`,
+`national_model_change_c` (collector); `national_model_hit`
+(settlement). These are `NaN`/`None` for the 11 cities without a
+matched model — expected, not an error.
+
+**Two distinct lead-time framings, both kept** (raised 2026-08):
+- `lead_time_hours` (unchanged): hours to the START of the target
+  local day. Standard NWP verification convention.
+- `hours_to_resolution` (new): hours to the END of the target local
+  day — i.e. how close to the moment the day's actual max temperature,
+  and therefore the market's outcome, is fully decided. A forecast
+  made 6h before the day starts is ~30h before the day ends; these
+  answer genuinely different questions and shouldn't be confused. Both
+  now have their own chart/table in the dashboard and downloadable
+  report, clearly labeled as distinct.
+
+**Dashboard addition**: a "🏆 Model Reliability by City" table now
+lives directly in the Backtesting section (not just the downloadable
+report), showing each model's hit rate per city and a "Best Model"
+column — the direct answer to "does JMA actually track Tokyo better
+than ECMWF." Requires 10+ settled observations for a city before
+naming a best model; below that it shows "—" rather than guessing from
+too little data.
+
+## CRITICAL FIX (2026-08, same day): market discovery was silently missing markets
+
+**Bug found**: `get_polymarket_prices_multi_date` returned on the
+FIRST candidate date with an open market and stopped — it never
+checked later dates in the same polling cycle. Combined with
+`candidate_dates` being capped at the 3 nearest days, this meant the
+collector could get stuck logging only the earliest currently-open
+market for a city (e.g. always Aug 15) even while Polymarket had Aug
+16/17/18 simultaneously open — those later markets were never even
+checked, let alone logged.
+
+**Fix**: `get_polymarket_prices_multi_date` now checks every candidate
+date and returns ALL matches, not just the first. `candidate_dates` no
+longer caps at 3 — it uses every date Open-Meteo's forecast response
+actually returned. `log_snapshot()` now loops over every matched
+(target_date, prices) pair and logs a separate row for each, so a
+single polling cycle correctly captures every simultaneously-open
+market for a city, not just one.
+
+**Related correctness fix**: `load_previous_snapshot()` (used to
+compute `ecmwf_change_c`/`gfs_change_c`/etc., the "change vs previous
+observation" fields) was keyed by city alone. Once a city can have
+multiple target dates in flight in the same cycle, that meant a
+"change" value could silently compare two DIFFERENT target dates'
+forecasts against each other rather than the same day an hour apart.
+Now keyed by `(city, target_date)`, so these deltas mean what they're
+supposed to mean.
+
+Verified with a mocked scenario: Tokyo with 3 simultaneously-open
+markets (Aug 16/17/18) now correctly produces 3 rows in one cycle
+(previously would have produced 1), and a repeat cycle correctly
+isolates each date's own change-vs-previous rather than blending them.
