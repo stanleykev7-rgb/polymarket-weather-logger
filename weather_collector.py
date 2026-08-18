@@ -41,113 +41,124 @@ NATIONAL_MODELS = {
 
 # 1. CITIES CONFIGURATION
 CITIES = {
+    # --- SETTLEMENT-STATION-PRECISE COORDINATES (2026-08) -------------------
+    # Every lat/lon below was updated from generic city-center coordinates
+    # to the EXACT station Polymarket names as its resolution source,
+    # confirmed by reading live Polymarket market rules pages for all 14
+    # cities (2026-08). This matters: forecasts for a city-center point can
+    # meaningfully diverge from the specific airport/station microclimate
+    # that actually settles the market -- coastal vs. urban heat island,
+    # elevation, distance from the coast, etc. Two are NOT even in the
+    # named city: Seoul settles via Incheon Airport (~50km away) and Buenos
+    # Aires via Ezeiza Airport (~35km away). See SCHEMA.md for the full
+    # per-city source list and links to the rules pages that confirmed each.
     "Hong Kong": {
-        "lat": 22.3193,
-        "lon": 114.1694,
+        "lat": 22.3020,  # HK Observatory HQ, Tsim Sha Tsui (non-airport; official source is HKO directly, not Wunderground)
+        "lon": 114.1740,
         "tz": "Asia/Hong_Kong",
         "slug_tag": "hong-kong",
         "search_term": "Highest temperature in Hong Kong",
         "unit": "C",
     },
     "Tokyo": {
-        "lat": 35.6762,
-        "lon": 139.6503,
+        "lat": 35.5494,  # Haneda Airport (RJTT)
+        "lon": 139.7798,
         "tz": "Asia/Tokyo",
         "slug_tag": "tokyo",
         "search_term": "Highest temperature in Tokyo",
         "unit": "C",
     },
     "Shanghai": {
-        "lat": 31.2304,
-        "lon": 121.4737,
+        "lat": 31.1443,  # Pudong Intl Airport (ZSPD)
+        "lon": 121.8083,
         "tz": "Asia/Shanghai",
         "slug_tag": "shanghai",
         "search_term": "Highest temperature in Shanghai",
         "unit": "C",
     },
     "Qingdao": {
-        "lat": 36.0671,
-        "lon": 120.3826,
+        "lat": 36.3620,  # Jiaodong Intl Airport (ZSQD) -- opened 2021, ~39km from city center; replaced the older Liuting airport
+        "lon": 120.0882,
         "tz": "Asia/Shanghai",
         "slug_tag": "qingdao",
         "search_term": "Highest temperature in Qingdao",
         "unit": "C",
     },
     "Seoul": {
-        "lat": 37.5665,
-        "lon": 126.9780,
+        "lat": 37.4602,  # Incheon Intl Airport (RKSI) -- NOT in Seoul; a separate city ~50km away. This is Polymarket's actual named source.
+        "lon": 126.4407,
         "tz": "Asia/Seoul",
         "slug_tag": "seoul",
         "search_term": "Highest temperature in Seoul",
         "unit": "C",
     },
     "Guangzhou": {
-        "lat": 23.1291,
-        "lon": 113.2644,
+        "lat": 23.3924,  # Baiyun Intl Airport (ZGGG)
+        "lon": 113.2988,
         "tz": "Asia/Shanghai",
         "slug_tag": "guangzhou",
         "search_term": "Highest temperature in Guangzhou",
         "unit": "C",
     },
     "Shenzhen": {
-        "lat": 22.5431,
-        "lon": 114.0579,
+        "lat": 22.6393,  # Bao'an Intl Airport (ZGSZ)
+        "lon": 113.8107,
         "tz": "Asia/Shanghai",
         "slug_tag": "shenzhen",
         "search_term": "Highest temperature in Shenzhen",
         "unit": "C",
     },
     "New York": {
-        "lat": 40.7128,
-        "lon": -74.0060,
+        "lat": 40.7769,  # LaGuardia Airport (KLGA) -- not JFK, not Manhattan
+        "lon": -73.8740,
         "tz": "America/New_York",
         "slug_tag": "nyc",
         "search_term": "Highest temperature in NYC",
         "unit": "F",
     },
     "Chicago": {
-        "lat": 41.8781,
-        "lon": -87.6298,
+        "lat": 41.9742,  # O'Hare Intl Airport (KORD)
+        "lon": -87.9073,
         "tz": "America/Chicago",
         "slug_tag": "chicago",
         "search_term": "Highest temperature in Chicago",
         "unit": "F",
     },
     "Miami": {
-        "lat": 25.7617,
-        "lon": -80.1918,
+        "lat": 25.7959,  # Miami Intl Airport (KMIA)
+        "lon": -80.2870,
         "tz": "America/New_York",
         "slug_tag": "miami",
         "search_term": "Highest temperature in Miami",
         "unit": "F",
     },
     "London": {
-        "lat": 51.5074,
-        "lon": -0.1278,
+        "lat": 51.5053,  # London City Airport (EGLC) -- not Heathrow
+        "lon": 0.0553,
         "tz": "Europe/London",
         "slug_tag": "london",
         "search_term": "Highest temperature in London",
         "unit": "C",
     },
     "Paris": {
-        "lat": 48.8566,
-        "lon": 2.3522,
+        "lat": 48.9694,  # Le Bourget Airport (LFPB) -- not Charles de Gaulle
+        "lon": 2.4414,
         "tz": "Europe/Paris",
         "slug_tag": "paris",
         "search_term": "Highest temperature in Paris",
         "unit": "C",
     },
     "Ankara": {
-        "lat": 39.9334,
-        "lon": 32.8597,
+        "lat": 40.1281,  # Esenboğa Intl Airport (LTAC)
+        "lon": 32.9951,
         "tz": "Europe/Istanbul",
         "slug_tag": "ankara",
         "search_term": "Highest temperature in Ankara",
         "unit": "C",
     },
     "Buenos Aires": {
-        "lat": -34.6037,
-        "lon": -58.3816,
+        "lat": -34.8222,  # Ministro Pistarini/Ezeiza Intl Airport (SAEZ) -- NOT in Buenos Aires proper; ~35km southwest
+        "lon": -58.5358,
         "tz": "America/Argentina/Buenos_Aires",
         "slug_tag": "buenos-aires",
         "search_term": "Highest temperature in Buenos Aires",

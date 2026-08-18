@@ -249,3 +249,48 @@ Verified with a mocked scenario: Tokyo with 3 simultaneously-open
 markets (Aug 16/17/18) now correctly produces 3 rows in one cycle
 (previously would have produced 1), and a repeat cycle correctly
 isolates each date's own change-vs-previous rather than blending them.
+
+## CRITICAL FIX (2026-08, same day): forecast coordinates now match the exact settlement station
+
+**Finding**: every city's forecast (ECMWF/GFS/ICON/national model) was being
+pulled for a generic city-center lat/lon, not the specific station
+Polymarket actually names as its resolution source. Confirmed by reading
+live Polymarket rules pages for all 14 cities. Two are not even in the
+named city:
+
+| City | Actual settlement station | Notes |
+|---|---|---|
+| Hong Kong | HKO Observatory HQ (Tsim Sha Tsui) | non-airport; official HKO source, not Wunderground |
+| Tokyo | Haneda Airport (RJTT) | |
+| Shanghai | Pudong Intl Airport (ZSPD) | |
+| Qingdao | Jiaodong Intl Airport (ZSQD) | opened 2021, ~39km from city center, replaced Liuting |
+| **Seoul** | **Incheon Intl Airport (RKSI)** | **not in Seoul — a separate city ~50km away** |
+| Guangzhou | Baiyun Intl Airport (ZGGG) | |
+| Shenzhen | Bao'an Intl Airport (ZGSZ) | |
+| New York | LaGuardia Airport (KLGA) | not JFK, not Manhattan |
+| Chicago | O'Hare Intl Airport (KORD) | |
+| Miami | Miami Intl Airport (KMIA) | |
+| London | London City Airport (EGLC) | not Heathrow |
+| Paris | Le Bourget Airport (LFPB) | not Charles de Gaulle |
+| Ankara | Esenboğa Intl Airport (LTAC) | |
+| **Buenos Aires** | **Ministro Pistarini/Ezeiza Airport (SAEZ)** | **~35km southwest of downtown** |
+
+**Fix**: `CITIES` in both `weather_collector.py` and `settle_outcomes.py`
+now use these exact station coordinates instead of city-center
+coordinates. Verified both files' coordinates are byte-identical to each
+other after the change.
+
+**This is a silent-but-significant change** — no new CSV columns, so it
+won't show up as a schema version bump, but every forecast logged from
+this point forward represents a meaningfully different (more correct)
+physical location for several cities, especially Seoul and Buenos Aires.
+Historical rows before this fix used the old city-center coordinates —
+this is intentional, not a bug, per the same "never rewrite history"
+principle as everything else in this project. If you want to mark a
+before/after cutover point in your own analysis, this commit is that
+line.
+
+**Not yet done**: NOAA/HKO settlement fetching in
+`official_settlement_sources.py` was unaffected by this change (it already
+queries by station ID directly, e.g. `KLGA`, not by lat/lon), so no update
+was needed there.

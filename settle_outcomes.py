@@ -35,20 +35,24 @@ EVALUATED_CSV = "polymarket_weather_evaluated.csv"
 # regardless (even for the 4 official cities) so you can cross-check the
 # proxy's accuracy against real data as it accumulates.
 CITIES = {
-    "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C", "tz": "Asia/Hong_Kong"},
-    "Tokyo": {"lat": 35.6762, "lon": 139.6503, "unit": "C", "tz": "Asia/Tokyo"},
-    "Shanghai": {"lat": 31.2304, "lon": 121.4737, "unit": "C", "tz": "Asia/Shanghai"},
-    "Qingdao": {"lat": 36.0671, "lon": 120.3826, "unit": "C", "tz": "Asia/Shanghai"},
-    "Seoul": {"lat": 37.5665, "lon": 126.9780, "unit": "C", "tz": "Asia/Seoul"},
-    "Guangzhou": {"lat": 23.1291, "lon": 113.2644, "unit": "C", "tz": "Asia/Shanghai"},
-    "Shenzhen": {"lat": 22.5431, "lon": 114.0579, "unit": "C", "tz": "Asia/Shanghai"},
-    "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F", "tz": "America/New_York"},
-    "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F", "tz": "America/Chicago"},
-    "Miami": {"lat": 25.7617, "lon": -80.1918, "unit": "F", "tz": "America/New_York"},
-    "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C", "tz": "Europe/London"},
-    "Paris": {"lat": 48.8566, "lon": 2.3522, "unit": "C", "tz": "Europe/Paris"},
-    "Ankara": {"lat": 39.9334, "lon": 32.8597, "unit": "C", "tz": "Europe/Istanbul"},
-    "Buenos Aires": {"lat": -34.6037, "lon": -58.3816, "unit": "C", "tz": "America/Argentina/Buenos_Aires"},
+    # Coordinates updated 2026-08 to match Polymarket's exact named
+    # settlement station (not city-center) -- see the matching CITIES
+    # dict in weather_collector.py for the full rationale and per-city
+    # source notes. Kept in sync with that dict intentionally.
+    "Hong Kong": {"lat": 22.3020, "lon": 114.1740, "unit": "C", "tz": "Asia/Hong_Kong"},
+    "Tokyo": {"lat": 35.5494, "lon": 139.7798, "unit": "C", "tz": "Asia/Tokyo"},
+    "Shanghai": {"lat": 31.1443, "lon": 121.8083, "unit": "C", "tz": "Asia/Shanghai"},
+    "Qingdao": {"lat": 36.3620, "lon": 120.0882, "unit": "C", "tz": "Asia/Shanghai"},
+    "Seoul": {"lat": 37.4602, "lon": 126.4407, "unit": "C", "tz": "Asia/Seoul"},
+    "Guangzhou": {"lat": 23.3924, "lon": 113.2988, "unit": "C", "tz": "Asia/Shanghai"},
+    "Shenzhen": {"lat": 22.6393, "lon": 113.8107, "unit": "C", "tz": "Asia/Shanghai"},
+    "New York": {"lat": 40.7769, "lon": -73.8740, "unit": "F", "tz": "America/New_York"},
+    "Chicago": {"lat": 41.9742, "lon": -87.9073, "unit": "F", "tz": "America/Chicago"},
+    "Miami": {"lat": 25.7959, "lon": -80.2870, "unit": "F", "tz": "America/New_York"},
+    "London": {"lat": 51.5053, "lon": 0.0553, "unit": "C", "tz": "Europe/London"},
+    "Paris": {"lat": 48.9694, "lon": 2.4414, "unit": "C", "tz": "Europe/Paris"},
+    "Ankara": {"lat": 40.1281, "lon": 32.9951, "unit": "C", "tz": "Europe/Istanbul"},
+    "Buenos Aires": {"lat": -34.8222, "lon": -58.5358, "unit": "C", "tz": "America/Argentina/Buenos_Aires"},
 }
 
 
