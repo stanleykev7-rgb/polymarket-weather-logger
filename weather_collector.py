@@ -1,17 +1,25 @@
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
 import re
 import time
 import uuid
+from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 from data_utils import compute_hours_to_resolution, compute_lead_time_hours, load_combined_log, resolve_write_target
+
+# How many days ahead (from each city's local "today") to check
+# Polymarket for an open market, independent of whatever the weather
+# forecast API happens to return for that same window (see log_snapshot
+# / get_weather_forecast FIX notes, 2026-08). 10 gives real headroom
+# beyond typical Polymarket listing patterns without over-querying.
+CANDIDATE_DATE_WINDOW_DAYS = 10
 
 # --- NATIONAL MODELS (schema v4, 2026-08) --------------------------------
 # City-specific national weather service models, matched to the city each
@@ -276,7 +284,7 @@ def create_resilient_session(retries=3, backoff_factor=1):
   return session
 
 
-def get_weather_forecast(lat, lon, tz, max_retries=3, national_model_id=None):
+def get_weather_forecast(lat, lon, tz, max_retries=3, national_model_id=None, forecast_days=10):
   # Third model (ICON) added 2026-08: DWD ICON ("dwd_icon_seamless" --
   # DWD's global ICON model, ~11km, blended with higher-resolution ICON
   # EU/D2 near Europe where available; sometimes referred to as
@@ -286,13 +294,25 @@ def get_weather_forecast(lat, lon, tz, max_retries=3, national_model_id=None):
   # national weather service model (JMA/UKMO/Météo-France -- see
   # NATIONAL_MODELS). Passed as an extra comma-joined model id so it's
   # requested in this SAME API call, no extra network round-trip.
+  #
+  # FIX (2026-08): forecast_days defaults to Open-Meteo's own default of
+  # 7 if not specified, which was silently capping how many future dates
+  # we could even consider checking Polymarket for. Now explicitly
+  # requests 10 (Open-Meteo supports up to 16) so a Polymarket market
+  # opened further out than a week is still checkable. This is now a
+  # secondary safety margin, not the primary mechanism -- see
+  # log_snapshot(): candidate_dates is generated independently by date
+  # arithmetic, not derived from whatever this response happens to
+  # include, so a gap here degrades gracefully (missing forecast values,
+  # flagged in data_quality) instead of silently skipping the date
+  # entirely.
   models = "ecmwf_ifs025,gfs_seamless,dwd_icon_seamless"
   if national_model_id:
     models += f",{national_model_id}"
 
   url = (
       f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-      f"&daily=temperature_2m_max&models={models}&timezone={tz}"
+      f"&daily=temperature_2m_max&models={models}&timezone={tz}&forecast_days={forecast_days}"
   )
   session = create_resilient_session(retries=max_retries)
 
@@ -592,23 +612,41 @@ def log_snapshot():
     base_quality_issues = []
     unit = info.get("unit", "C")
 
-    # 1. Fetch Local Weather Forecasts (°C)
+    # 1. Generate candidate target dates INDEPENDENTLY of the forecast
+    # response (FIX 2026-08, second pass): previously candidate_dates
+    # was derived from forecasts_by_date.keys(), which meant our
+    # Polymarket search window was silently capped by whatever
+    # Open-Meteo's response happened to include (its own default is 7
+    # days if forecast_days isn't specified -- confirmed via Open-Meteo's
+    # docs). If a market was open further out than that, or a transient
+    # gap shortened the response, we'd never even attempt to check
+    # Polymarket for it. Now it's plain date arithmetic in the city's
+    # LOCAL timezone, so the Polymarket search window is never coupled
+    # to forecast API response quirks.
+    today_local = now_dt.astimezone(ZoneInfo(info["tz"])).date()
+    candidate_dates = [
+        (today_local + timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(CANDIDATE_DATE_WINDOW_DAYS)
+    ]
+
+    # 2. Fetch Local Weather Forecasts (°C). forecast_days is requested
+    # generously (see get_weather_forecast) so it should cover the full
+    # candidate_dates window above -- but even if a specific date is
+    # missing from this response, that date is still checked against
+    # Polymarket below (just with forecast values coming back None,
+    # flagged via *_FORECAST_MISSING in data_quality, rather than the
+    # date being silently skipped).
     national_model_id, national_model_name = NATIONAL_MODELS.get(city_name, (None, None))
     try:
       forecasts_by_date = get_weather_forecast(
-          info["lat"], info["lon"], info["tz"], national_model_id=national_model_id
+          info["lat"], info["lon"], info["tz"], national_model_id=national_model_id,
+          forecast_days=CANDIDATE_DATE_WINDOW_DAYS + 2,
       )
-      # FIX (2026-08): previously capped at [:3], which silently missed
-      # Polymarket markets open further out (observed: Polymarket had
-      # Aug 18 open while this only ever checked up to 3 days ahead).
-      # Now uses every date Open-Meteo actually returned.
-      candidate_dates = sorted(list(forecasts_by_date.keys()))
     except Exception:
       forecasts_by_date = {}
-      candidate_dates = [now_dt.strftime("%Y-%m-%d")]
       base_quality_issues.append("WEATHER_FETCH_FAILED")
 
-    # 2. Fetch ALL Active Market Prices for every candidate date (FIX
+    # 3. Fetch ALL Active Market Prices for every candidate date (FIX
     # 2026-08: previously stopped at the first match, so simultaneously
     # open markets for later dates were never logged at all -- see
     # get_polymarket_prices_multi_date docstring).
@@ -626,6 +664,8 @@ def log_snapshot():
 
     for target_date, poly_prices in matches:
       quality_issues = list(base_quality_issues)
+      if target_date not in forecasts_by_date:
+        quality_issues.append("FORECAST_MISSING_FOR_TARGET_DATE")
 
       day_weather = forecasts_by_date.get(target_date, {})
       ecmwf_t_c = day_weather.get("ecmwf")

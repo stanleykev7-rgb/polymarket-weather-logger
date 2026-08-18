@@ -294,3 +294,36 @@ line.
 `official_settlement_sources.py` was unaffected by this change (it already
 queries by station ID directly, e.g. `KLGA`, not by lat/lon), so no update
 was needed there.
+
+## SECOND market-discovery fix (2026-08, later same day): candidate dates were still capped by the forecast API's response window
+
+**Finding**: even after the first market-discovery fix (checking every
+candidate date instead of stopping at the first match), `candidate_dates`
+was still *generated from* `forecasts_by_date.keys()` — i.e. from
+whatever dates Open-Meteo's forecast response happened to include.
+Open-Meteo's `/v1/forecast` defaults to a 7-day window unless
+`forecast_days` is explicitly set (confirmed via their own docs — up to
+16 is supported). This meant a Polymarket market open further out than
+that response window (or shortened by a transient API response) could
+never even be *checked*, regardless of the earlier fix.
+
+**Fix, two parts**:
+1. `get_weather_forecast` now explicitly requests
+   `forecast_days=CANDIDATE_DATE_WINDOW_DAYS + 2` (12 by default) instead
+   of relying on Open-Meteo's default.
+2. `candidate_dates` is now generated independently by plain date
+   arithmetic in each city's **local** timezone (today through
+   `CANDIDATE_DATE_WINDOW_DAYS` = 10 days ahead), not derived from the
+   forecast response at all. Polymarket is checked across this full
+   window regardless of what the forecast API returned. If a specific
+   date's forecast happens to be missing from that response, the row is
+   still logged (Polymarket price data intact) with forecast fields as
+   `None` and a new `FORECAST_MISSING_FOR_TARGET_DATE` data-quality flag,
+   instead of the date being silently skipped entirely.
+
+**Verified** with a mocked scenario: Open-Meteo's response covering only
+3 days, Polymarket having a market open on day+8 (day 9 total, well
+outside that response) — confirmed the day+8 market is still found,
+logged, and correctly flagged for its missing forecast values, rather
+than silently dropped. Also verified normal full-coverage operation
+produces clean rows with no spurious flags.
