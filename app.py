@@ -2,7 +2,6 @@ import json
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 import report_builder as rb
@@ -12,6 +11,154 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ---------------------------------------------------------------------------
+# Styling (2026-08 UX pass)
+# ---------------------------------------------------------------------------
+# Consistent color per model across every chart/table in this dashboard,
+# so "purple = ICON" holds everywhere instead of Plotly's default
+# palette reassigning colors per-chart. Matches the approved mockup.
+MODEL_COLORS = {
+    "ECMWF": "#378ADD",
+    "GFS": "#D85A30",
+    "ICON": "#7F77DD",
+    "National Model": "#1D9E75",
+    "Market Favorite": "#EF9F27",
+}
+# Light-fill / dark-text pairs per model, for HTML badges/table cells.
+# (light, dark-text) -- values chosen for reasonable contrast on a white
+# card background, roughly matching each model's hue above.
+MODEL_TINTS = {
+    "ECMWF": ("#E6F1FB", "#0C447C"),
+    "GFS": ("#FAECE7", "#712B13"),
+    "ICON": ("#EEEDFE", "#26215C"),
+    "National Model": ("#E1F5EE", "#04342C"),
+    "Market Favorite": ("#FAEEDA", "#412402"),
+}
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+    /* Pill-style tabs */
+    div[data-testid="stTabs"] button[data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 8px 16px;
+        font-weight: 500;
+    }
+    div[data-testid="stTabs"] button[aria-selected="true"] {
+        background-color: rgba(127, 119, 221, 0.12);
+        color: #534AB7;
+    }
+
+    /* Metric cards */
+    .metric-card {
+        background: #F7F7F5;
+        border-radius: 10px;
+        padding: 16px 18px;
+        height: 100%;
+    }
+    .metric-card .metric-label {
+        font-size: 13px;
+        color: #6B6A66;
+        margin: 0 0 6px 0;
+    }
+    .metric-card .metric-value {
+        font-size: 26px;
+        font-weight: 600;
+        margin: 0;
+        line-height: 1.2;
+    }
+    .metric-card .metric-sub {
+        font-size: 13px;
+        color: #8A8983;
+        margin: 4px 0 0 0;
+    }
+
+    /* Heatmap table */
+    .heat-table { border-collapse: separate; border-spacing: 3px; width: 100%; font-size: 12px; }
+    .heat-table th { font-weight: 400; color: #8A8983; text-align: center; padding: 4px; }
+    .heat-table td.rowlabel { text-align: left; padding: 8px 6px; color: #4A4A46; white-space: nowrap; }
+    .heat-table td.cell { text-align: center; padding: 8px 4px; border-radius: 4px; }
+    .heat-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def metric_card_html(label, value, sub=None):
+    sub_html = f'<p class="metric-sub">{sub}</p>' if sub else ""
+    return (
+        f'<div class="metric-card"><p class="metric-label">{label}</p>'
+        f'<p class="metric-value">{value}</p>{sub_html}</div>'
+    )
+
+
+def render_metric_row(cards):
+    """cards: list of (label, value, sub_or_None). Renders as equal-width columns."""
+    cols = st.columns(len(cards))
+    for col, (label, value, sub) in zip(cols, cards):
+        with col:
+            st.markdown(metric_card_html(label, value, sub), unsafe_allow_html=True)
+
+
+def _blend_hex(hex_color, alpha):
+    """Blend hex_color with white at the given alpha (0-1), computed in
+    plain Python rather than relying on CSS color-mix() -- verified via
+    a headless render that color-mix() silently fails to apply on at
+    least one rendering engine, leaving cells blank. This guarantees
+    the intended color regardless of what renders the page.
+    """
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = round(r * alpha + 255 * (1 - alpha))
+    g = round(g * alpha + 255 * (1 - alpha))
+    b = round(b * alpha + 255 * (1 - alpha))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def render_model_heatmap_html(resolution_table, models):
+    """Builds the color-coded model x time-window heatmap as an HTML
+    table (matching the approved mockup) rather than a Plotly heatmap --
+    Plotly's Heatmap only supports one colorscale for the whole grid,
+    but this needs a distinct color ramp PER MODEL ROW so each model's
+    color stays consistent with every other chart in the dashboard.
+    """
+    if resolution_table.empty:
+        return None
+    buckets = resolution_table["resolution_bucket"].astype(str).tolist()
+    header = "<tr><th></th>" + "".join(f"<th>{b}</th>" for b in buckets) + "</tr>"
+    rows_html = []
+    for m in models:
+        light, dark = MODEL_TINTS.get(m, ("#F0F0EE", "#333"))
+        dot_color = MODEL_COLORS.get(m, "#888")
+        rate_col = f"{m}_hit_rate"
+        max_rate = resolution_table[rate_col].max() if rate_col in resolution_table.columns else None
+        row = f'<tr><td class="rowlabel"><span class="heat-dot" style="background:{dot_color};"></span>{m}</td>'
+        for _, r in resolution_table.iterrows():
+            rate = r.get(rate_col)
+            n = r.get(f"{m}_n", 0)
+            if pd.isna(rate):
+                row += '<td class="cell" style="background:#F0F0EE; color:#B0AFA8;">—</td>'
+            else:
+                # Intensity scales this model's own color by hit rate,
+                # so higher rates look visually "stronger" within that
+                # model's own color family -- computed in Python, not
+                # CSS color-mix(), for renderer compatibility.
+                alpha = max(0.15, min(1.0, rate * 1.3))
+                bg = _blend_hex(dot_color, alpha)
+                text_color = dark if alpha < 0.55 else "#FFFFFF"
+                weight = 600 if pd.notnull(max_rate) and rate == max_rate else 400
+                row += (
+                    f'<td class="cell" style="background:{bg}; color:{text_color}; font-weight:{weight};">'
+                    f'{rate*100:.0f}%<br><span style="font-size:10px; opacity:0.85;">n={int(n)}</span></td>'
+                )
+        row += "</tr>"
+        rows_html.append(row)
+    return f'<table class="heat-table">{header}{"".join(rows_html)}</table>'
 
 
 # ---------------------------------------------------------------------------
@@ -124,26 +271,15 @@ with tab_live:
             df_active.sort_values("timestamp_utc").groupby("city").last().reset_index()
         )
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Cities Tracked", len(latest))
-        col2.metric(
-            "Avg Model Spread (|ECMWF−GFS|)",
-            fmt_c(latest["abs_model_spread_c"].mean())
-            if has_col(latest, "abs_model_spread_c")
-            else "—",
-        )
-        col3.metric(
-            "Avg Market Implied Temp",
-            fmt_c(latest["market_implied_temp_c"].mean())
-            if has_col(latest, "market_implied_temp_c")
-            else "—",
-        )
-        flagged = (
-            (latest["data_quality"] != "OK").sum()
-            if has_col(latest, "data_quality")
-            else 0
-        )
-        col4.metric("Rows w/ Data Quality Flags", int(flagged))
+        render_metric_row([
+            ("Cities Tracked", len(latest), None),
+            ("Avg Model Spread (|ECMWF−GFS|)",
+             fmt_c(latest["abs_model_spread_c"].mean()) if has_col(latest, "abs_model_spread_c") else "—", None),
+            ("Avg Market Implied Temp",
+             fmt_c(latest["market_implied_temp_c"].mean()) if has_col(latest, "market_implied_temp_c") else "—", None),
+            ("Rows w/ Data Quality Flags",
+             int((latest["data_quality"] != "OK").sum()) if has_col(latest, "data_quality") else 0, None),
+        ])
 
         st.subheader("Forecast vs. Market, by City")
         display_cols = {
@@ -242,6 +378,7 @@ with tab_live:
             fig2 = px.bar(
                 plot_df, x="city", y="temp_c", color="source", barmode="group",
                 labels={"temp_c": "°C", "city": "City", "source": ""},
+                color_discrete_map={**MODEL_COLORS, "Market Implied": "#888883"},
             )
             st.plotly_chart(fig2, use_container_width=True)
         else:
@@ -270,11 +407,11 @@ with tab_backtest:
     else:
         settled["ecmwf_hit"] = settled["ecmwf_hit"].astype(bool)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Settled Observations", len(settled))
-        col2.metric("ECMWF Bucket Hit Rate", fmt_pct(settled["ecmwf_hit"].mean()))
-        unresolved = df["ecmwf_hit"].isna().sum() if has_col(df, "ecmwf_hit") else 0
-        col3.metric("Unresolved / Not Yet Settled", int(unresolved))
+        render_metric_row([
+            ("Settled Observations", len(settled), None),
+            ("ECMWF Bucket Hit Rate", fmt_pct(settled["ecmwf_hit"].mean()), None),
+            ("Unresolved / Not Yet Settled", int(df["ecmwf_hit"].isna().sum()) if has_col(df, "ecmwf_hit") else 0, None),
+        ])
 
         st.subheader("Hit Rate by Model Disagreement")
         if has_col(settled, "abs_model_spread_c"):
@@ -295,6 +432,7 @@ with tab_backtest:
                     text=by_spread["count"].apply(lambda c: f"n={c}"),
                     labels={"spread_bucket": "|ECMWF − GFS|", "mean": "ECMWF Hit Rate"},
                     title="Does ECMWF's bucket win more/less often when models disagree more?",
+                    color_discrete_sequence=[MODEL_COLORS["ECMWF"]],
                 )
                 fig3.update_yaxes(tickformat=".0%")
                 st.plotly_chart(fig3, use_container_width=True)
@@ -327,6 +465,7 @@ with tab_backtest:
                     text=by_lead["count"].apply(lambda c: f"n={c}"),
                     labels={"lead_bucket": "Lead Time (to day start)", "mean": "ECMWF Hit Rate"},
                     title="Does ECMWF's bucket accuracy change with lead time?",
+                    color_discrete_sequence=[MODEL_COLORS["ECMWF"]],
                 )
                 fig4.update_yaxes(tickformat=".0%")
                 st.plotly_chart(fig4, use_container_width=True)
@@ -361,6 +500,7 @@ with tab_backtest:
                     text=by_res["count"].apply(lambda c: f"n={c}"),
                     labels={"resolution_bucket": "Time to Resolution (to day end)", "mean": "ECMWF Hit Rate"},
                     title="Does ECMWF's bucket accuracy sharpen closer to resolution?",
+                    color_discrete_sequence=[MODEL_COLORS["ECMWF"]],
                 )
                 fig4b.update_yaxes(tickformat=".0%")
                 st.plotly_chart(fig4b, use_container_width=True)
@@ -467,45 +607,27 @@ with tab_reliability:
                     row = valid_windows.loc[valid_windows[rc].idxmax()]
                     best_window, best_window_rate = row["resolution_bucket"], row[rc]
 
-        card1, card2, card3 = st.columns(3)
-        card1.metric("Best Model", best_model or "—", fmt_pct(valid_rates.get(best_model)) if best_model else None)
-        card2.metric("Best Time Window", str(best_window) if best_window else "—",
-                     fmt_pct(best_window_rate) if best_window_rate is not None else None)
-        card3.metric("Settled Observations", summary["settled_n"])
+        render_metric_row([
+            ("Best Model", best_model or "—", fmt_pct(valid_rates.get(best_model)) if best_model else None),
+            ("Best Time Window", str(best_window) if best_window else "—",
+             fmt_pct(best_window_rate) if best_window_rate is not None else None),
+            ("Settled Observations", summary["settled_n"], None),
+        ])
         st.caption(f"Scope: {rel_city} · {rel_range_label.lower()}")
 
-        # --- Heatmap: model x time-to-resolution window ---
+        # --- Heatmap: model x time-to-resolution window (color-coded per
+        # model, matching every other chart in this dashboard -- see
+        # render_model_heatmap_html for why this is a custom HTML table
+        # rather than a Plotly heatmap) ---
         st.subheader("Hit Rate by Model × Time to Resolution")
         if not resolution_table.empty:
             models = list(rb.MODEL_HIT_COLS.keys())
-            buckets = resolution_table["resolution_bucket"].astype(str).tolist()
-            z, text = [], []
-            for m in models:
-                row_z, row_text = [], []
-                for _, r in resolution_table.iterrows():
-                    rate = r.get(f"{m}_hit_rate")
-                    n = r.get(f"{m}_n", 0)
-                    if pd.isna(rate):
-                        row_z.append(None)
-                        row_text.append("—")
-                    else:
-                        row_z.append(rate * 100)
-                        row_text.append(f"{rate*100:.0f}%<br>n={int(n)}")
-                z.append(row_z)
-                text.append(row_text)
-            heatmap_fig = go.Figure(data=go.Heatmap(
-                z=z, x=buckets, y=models, text=text, texttemplate="%{text}",
-                colorscale="Blues", zmin=0, zmax=100,
-                colorbar=dict(title="Hit Rate %"), hoverongaps=False,
-            ))
-            heatmap_fig.update_layout(
-                xaxis_title="Time to Resolution (before target day ends)",
-                height=320, margin=dict(t=20, b=20),
-            )
-            st.plotly_chart(heatmap_fig, use_container_width=True)
+            heatmap_html = render_model_heatmap_html(resolution_table, models)
+            st.markdown(heatmap_html, unsafe_allow_html=True)
             st.caption(
                 "Rows = models. Columns = how close to resolution the observation was. "
-                "Darker = higher hit rate. '—' means no settled observations in that cell yet."
+                "Darker = higher hit rate within that model's own color. '—' means no "
+                "settled observations in that cell yet. Bold = that model's best window."
             )
         else:
             st.caption("Not enough settled data with resolution-time info for a heatmap yet.")
@@ -520,6 +642,7 @@ with tab_reliability:
                     trend_fig = px.line(
                         trend, x="target_date", y=rc, markers=True,
                         labels={"target_date": "Target Date", rc: "Hit Rate"},
+                        color_discrete_sequence=[MODEL_COLORS.get(best_model, "#7F77DD")],
                     )
                     trend_fig.update_yaxes(tickformat=".0%", range=[0, 1])
                     st.plotly_chart(trend_fig, use_container_width=True)
