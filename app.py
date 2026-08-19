@@ -42,15 +42,23 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-    /* Pill-style tabs */
-    div[data-testid="stTabs"] button[data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-        padding: 8px 16px;
-        font-weight: 500;
+    /* Pill-style tabs. Broader selector (role="tab" is the stable ARIA
+       attribute BaseWeb/Streamlit's tabs use) + !important, since
+       Streamlit's own tab styling was overriding the plain version of
+       this rule (confirmed via screenshot: no pill background applied,
+       just the default underline indicator). Also neutralizes that
+       underline bar so it doesn't compete visually with the pill. */
+    div[data-testid="stTabs"] button[role="tab"] {
+        border-radius: 8px 8px 0 0 !important;
+        padding: 8px 16px !important;
+        font-weight: 500 !important;
     }
-    div[data-testid="stTabs"] button[aria-selected="true"] {
-        background-color: rgba(127, 119, 221, 0.12);
-        color: #534AB7;
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+        background-color: rgba(127, 119, 221, 0.14) !important;
+        color: #534AB7 !important;
+    }
+    div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+        background-color: transparent !important;
     }
 
     /* Metric cards */
