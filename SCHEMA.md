@@ -327,3 +327,43 @@ outside that response) — confirmed the day+8 market is still found,
 logged, and correctly flagged for its missing forecast values, rather
 than silently dropped. Also verified normal full-coverage operation
 produces clean rows with no spurious flags.
+
+## THIRD market-discovery fix (2026-08, later same day): likely rate-limiting from the widened date window
+
+**Reported symptom**: Tokyo's Aug 21 market was visibly open on Polymarket
+but never appeared in the dashboard, despite the previous fix widening
+the candidate-date search to 10 days (which easily covers today+2).
+
+**Root cause analysis**: the previous fix, while structurally correct
+(verified by test at the time), had a side effect — checking all 10
+candidate dates unconditionally raised Polymarket API request volume
+roughly 10x per city per hour (up to ~30 requests: 2 slug patterns + a
+search fallback, times 10 dates). This is a strong candidate for silent
+rate-limiting specifically on the LATER dates checked in each city's
+loop, since exceptions/non-200s are caught and simply treated as "no
+market found" — which would produce exactly the reported symptom (near
+dates work, a real further-out market silently doesn't).
+
+**Fix**: `get_polymarket_prices_multi_date` now stops checking further
+dates once it has found at least one open market AND then hits 2
+consecutive dates with no market — reflecting how Polymarket actually
+operates (a contiguous rolling window of open dates, not scattered
+gaps), cutting typical request volume roughly in half to two-thirds
+while still correctly finding every currently-open date. Also adds a
+small delay between per-date checks. If zero markets have been found
+yet, it still checks the full window (there could be a temporary gap
+before a city's window opens).
+
+**Diagnostics added**: both `get_polymarket_prices_multi_date` and the
+calling loop in `log_snapshot()` now print per-date status to stdout
+(candidate window checked, per-date match/no-match with HTTP status,
+early-stop trigger). This shows up directly in the GitHub Actions log —
+if this symptom recurs, check the log for a specific city/date to see
+whether it's a deploy issue, a genuine rate limit (repeated non-200
+statuses), or Polymarket genuinely not having that market open yet,
+instead of having to guess.
+
+**Verified**: with a mocked HTTP layer simulating exactly the reported
+scenario (Aug 19/20/21 open, nothing beyond), confirmed the function
+finds all 3 dates including Aug 21, then correctly stops after 2
+consecutive misses -- 9 requests instead of a theoretical ~30.

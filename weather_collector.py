@@ -377,22 +377,46 @@ def parse_event_markets(event_data):
   return bucket_prices
 
 
-def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
-  """Returns a list of (target_date_str, prices_dict) for EVERY candidate
-  date that has an active, priced market -- not just the first one found.
+def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates, verbose=True):
+  """Returns a list of (target_date_str, prices_dict) for candidate
+  dates that have an active, priced market -- not just the first one
+  found.
 
-  FIX (2026-08): previously this returned on the first match and
-  stopped, so a single polling cycle only ever logged the single
-  soonest open market for a city and silently never even checked later
-  dates (e.g. Polymarket having Aug 16/17/18 all open simultaneously
-  would only ever produce an Aug 16 row, every cycle, until Aug 16
-  closed). Now it checks every candidate date and returns all matches,
-  so all currently-open markets for a city get logged in the same
-  cycle.
+  FIX (2026-08, first pass): previously this returned on the first
+  match and stopped, so a single polling cycle only ever logged the
+  single soonest open market for a city and silently never even
+  checked later dates.
+
+  FIX (2026-08, third pass): widening the candidate-date window to 10
+  days (see CANDIDATE_DATE_WINDOW_DAYS) meant checking every one of
+  those dates against Polymarket unconditionally -- up to ~30 requests
+  per city per hour (2 slug patterns + a search fallback, times 10
+  dates), a ~10x jump from before. That's a real, plausible cause of
+  silent rate-limiting on the LATER dates checked within a city's loop
+  (earlier/nearer dates would tend to succeed, later/farther ones
+  quietly fail) -- which would produce exactly the reported symptom of
+  near-term dates showing up but a genuinely-open further-out market
+  not appearing.
+
+  Mitigation: stop checking further dates once we've found at least one
+  match AND then hit 2 consecutive dates with no market -- Polymarket
+  opens a contiguous rolling window of dates, not scattered gaps, so
+  this reflects reality (we've run past the open window) rather than
+  silently giving up. If we haven't found any match yet, we keep
+  checking the full window (there could be a temporary gap before the
+  window opens for that city). Also adds a small delay between
+  per-date checks to reduce request bursts.
+
+  Set verbose=True (default) to print a per-date diagnostic line to
+  stdout -- this shows up in the GitHub Actions log and is the fastest
+  way to tell "fix not deployed" apart from "rate limited" apart from
+  "Polymarket genuinely doesn't have this market open yet" the next
+  time this is reported.
   """
   session = create_resilient_session()
   slug_tag = city_info["slug_tag"]
   found = []
+  consecutive_misses_after_hit = 0
 
   for target_date_str in forecast_dates:
     dt = datetime.strptime(target_date_str, "%Y-%m-%d")
@@ -405,10 +429,12 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
     ]
 
     matched_prices = None
+    last_status = None
     for event_slug in patterns:
       url_slug = f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
       try:
         res = session.get(url_slug, timeout=10)
+        last_status = res.status_code
         if res.status_code == 200:
           event = res.json()
           if event and not event.get("closed", False):
@@ -416,8 +442,8 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
             if prices:
               matched_prices = prices
               break
-      except Exception:
-        pass
+      except Exception as e:
+        last_status = f"error: {e}"
 
     if matched_prices is None:
       search_query = city_info.get(
@@ -430,6 +456,7 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
             params={"active": "true", "closed": "false", "q": search_query},
             timeout=10,
         )
+        last_status = res.status_code
         if res.status_code == 200:
           events = res.json()
           if isinstance(events, list):
@@ -444,11 +471,25 @@ def get_polymarket_prices_multi_date(city_name, city_info, forecast_dates):
                 if prices:
                   matched_prices = prices
                   break
-      except Exception:
-        pass
+      except Exception as e:
+        last_status = f"error: {e}"
 
     if matched_prices:
       found.append((target_date_str, matched_prices))
+      consecutive_misses_after_hit = 0
+      if verbose:
+        print(f"    [{city_name}] {target_date_str}: MATCH ({len(matched_prices)} buckets)")
+    else:
+      if verbose:
+        print(f"    [{city_name}] {target_date_str}: no market (last HTTP status: {last_status})")
+      if found:
+        consecutive_misses_after_hit += 1
+        if consecutive_misses_after_hit >= 2:
+          if verbose:
+            print(f"    [{city_name}] stopping early after 2 consecutive misses past the open window")
+          break
+
+    time.sleep(0.15)  # small gap between per-date checks to reduce burst load
 
   return found
 
@@ -628,6 +669,7 @@ def log_snapshot():
         (today_local + timedelta(days=offset)).strftime("%Y-%m-%d")
         for offset in range(CANDIDATE_DATE_WINDOW_DAYS)
     ]
+    print(f"[{city_name}] checking candidate dates {candidate_dates[0]} .. {candidate_dates[-1]} ({info['tz']})")
 
     # 2. Fetch Local Weather Forecasts (°C). forecast_days is requested
     # generously (see get_weather_forecast) so it should cover the full
