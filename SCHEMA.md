@@ -367,3 +367,44 @@ instead of having to guess.
 scenario (Aug 19/20/21 open, nothing beyond), confirmed the function
 finds all 3 dates including Aug 21, then correctly stops after 2
 consecutive misses -- 9 requests instead of a theoretical ~30.
+
+## New: Signal Analysis tab + JSON export (2026-08)
+
+Added `signal_analysis.py` and a new "🔮 Signal Analysis" dashboard tab.
+For each (city, model, time-to-resolution window), compares the
+**observed hit rate** against the **market's own average priced
+probability** for that model's matched bucket, across the same
+observations — i.e. a genuine calibration-gap analysis, not a
+synthetic baseline.
+
+**Deliberately descriptive, not prescriptive** — consistent with the
+project's founding principle of keeping trading logic out of this
+layer. No buy/sell labels, no scores, no ranked recommendations. Every
+number ships with a 95% Wilson confidence interval and an explicit
+sample size, so a thin/noisy result is visibly thin/noisy rather than
+looking as trustworthy as a well-sampled one.
+
+**Two sample-size numbers, shown separately, on purpose**:
+- `n_rows` — row-level observation count. Hit rate and its confidence
+  interval are computed from this (internally consistent with each
+  other).
+- `n_distinct_markets` — count of distinct (city, target_date) markets
+  contributing. This is what the dashboard's sample-size filter
+  actually filters on, since `n_rows` can substantially overcount —
+  a single still-resolving market gets logged on every hourly poll, so
+  many rows can share one real-world outcome, not represent independent
+  samples.
+
+**Export**: a "Download signals (JSON)" button includes every
+contributing signal (before the UI's sample-size filter) plus a
+`methodology` block spelling out exactly what each field means —
+written so a human or another AI agent can consume it correctly
+without needing this file for context.
+
+**Verified**: Wilson CI math checked against known reference behavior
+(width shrinks with n, never collapses to a point at small n, stays
+within [0,1]); confirmed hit_rate always falls within its own CI across
+274 test cells (0 violations); confirmed JSON export serializes cleanly
+(explicit int()/float() casts avoid the common numpy-dtype
+serialization failure); tested empty-data, impossible-filter-threshold,
+and single-city-scope edge cases, all handled without crashing.

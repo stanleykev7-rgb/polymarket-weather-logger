@@ -5,6 +5,7 @@ import plotly.express as px
 import streamlit as st
 
 import report_builder as rb
+import signal_analysis as sa
 
 st.set_page_config(
     page_title="PolyMarket Weather Data Explorer",
@@ -262,8 +263,8 @@ def fmt_c(x):
     return "—" if pd.isna(x) else f"{x:.1f}°C"
 
 
-tab_live, tab_backtest, tab_reliability, tab_quality, tab_report = st.tabs(
-    ["📍 Live Snapshot", "📈 Backtesting", "🏆 Model Reliability", "🧪 Data Quality", "📄 Performance Report"]
+tab_live, tab_backtest, tab_reliability, tab_signals, tab_quality, tab_report = st.tabs(
+    ["📍 Live Snapshot", "📈 Backtesting", "🏆 Model Reliability", "🔮 Signal Analysis", "🧪 Data Quality", "📄 Performance Report"]
 )
 
 
@@ -698,6 +699,101 @@ with tab_reliability:
                     mae_cols = {c: c.replace("_mae_c", " MAE (°C)").replace("_", " ") for c in city_mae.columns if c.endswith("_mae_c")}
                     mae_table = city_mae[["city", "n", *mae_cols.keys()]].rename(columns={"city": "City", "n": "n", **mae_cols})
                     st.dataframe(mae_table, use_container_width=True, hide_index=True)
+
+
+# ===========================================================================
+# TAB: Signal Analysis
+# ===========================================================================
+with tab_signals:
+    st.caption(
+        "For each (city, model, time-window), compares the observed hit rate "
+        "against what the market itself actually priced that model's matched "
+        "bucket at, on average, across the same observations. This is "
+        "descriptive statistics, not a trading recommendation -- read the "
+        "confidence intervals and sample sizes, then decide for yourself."
+    )
+
+    sig_col1, sig_col2, sig_col3 = st.columns([1, 1, 1])
+    with sig_col1:
+        sig_city = st.selectbox("Scope", options=["All Cities"] + all_cities, key="sig_city")
+    with sig_col2:
+        sig_min_n = st.slider(
+            "Min sample size (distinct markets)", min_value=10, max_value=80, value=30, step=5,
+            help="Filters on n_distinct_markets, the conservative sample-size measure -- see caption below the table.",
+        )
+    with sig_col3:
+        sig_sort = st.selectbox("Sort by", options=["Edge (largest magnitude first)", "Sample size"], key="sig_sort")
+
+    sig_city_arg = None if sig_city == "All Cities" else sig_city
+    candidates = sa.compute_signal_candidates(df, city=sig_city_arg)
+
+    if candidates.empty:
+        st.info("No settled data with resolution-time info yet for this scope.")
+    else:
+        filtered = candidates[candidates["n_distinct_markets"] >= sig_min_n].copy()
+        if sig_sort == "Edge (largest magnitude first)":
+            filtered = filtered.sort_values("edge", key=lambda s: s.abs(), ascending=False)
+        else:
+            filtered = filtered.sort_values("n_distinct_markets", ascending=False)
+
+        st.caption(
+            f"{len(filtered)} of {len(candidates)} (city, model, window) combinations meet the "
+            f"{sig_min_n}+ distinct-market threshold."
+        )
+
+        if filtered.empty:
+            st.info("No combinations meet this sample-size threshold yet. Try lowering it, or wait for more data.")
+        else:
+            rows_html = ""
+            for _, r in filtered.iterrows():
+                dot_color = MODEL_COLORS.get(r["model"], "#888")
+                edge_pp = r["edge"] * 100 if pd.notnull(r["edge"]) else None
+                edge_str = f'{"+" if edge_pp >= 0 else ""}{edge_pp:.0f}pp' if edge_pp is not None else "—"
+                ci_str = f'[{r["ci_low"]*100:.0f}-{r["ci_high"]*100:.0f}%]' if pd.notnull(r["ci_low"]) else ""
+                baseline_str = f'{r["market_price_mean"]*100:.0f}%' if pd.notnull(r["market_price_mean"]) else "—"
+                rows_html += (
+                    '<tr>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF;">{r["city"]}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF;">'
+                    f'<span class="heat-dot" style="background:{dot_color};"></span>{r["model"]}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{r["window"]}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF;">{r["hit_rate"]*100:.0f}% '
+                    f'<span style="color:#8A8983; font-size:11px;">{ci_str}</span></td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{baseline_str}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; font-weight:600;">{edge_str}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{r["n_rows"]}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{r["n_distinct_markets"]}</td>'
+                    '</tr>'
+                )
+            header_html = (
+                '<tr>' + "".join(
+                    f'<th style="text-align:left; padding:8px 10px; color:#8A8983; font-weight:400; '
+                    f'border-bottom:0.5px solid #E5E4DF;">{h}</th>'
+                    for h in ["City", "Model", "Window", "Hit Rate (95% CI)", "Avg Market Price", "Edge", "n rows", "n markets"]
+                ) + '</tr>'
+            )
+            st.markdown(
+                f'<table style="width:100%; border-collapse:collapse; font-size:13px;">{header_html}{rows_html}</table>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Edge = hit rate minus the market's own average priced probability for that bucket, in "
+                "percentage points (pp). Positive = this model beat the market's pricing in this sample; "
+                "negative = the opposite. n rows = row-level observations (may include repeated hourly "
+                "looks at the same still-resolving market). n markets = distinct (city, date) markets -- "
+                "the more conservative number, and what the slider above filters on."
+            )
+
+        st.divider()
+        st.subheader("Export")
+        st.caption("Downloads the full signal table (before the sample-size filter above) as JSON, with a methodology block explaining every field -- suitable for a human analyst or another AI agent to consume without additional context.")
+        export_payload = sa.build_signal_export(candidates, min_n=sig_min_n, city_scope=sig_city)
+        st.download_button(
+            "Download signals (JSON)",
+            data=json.dumps(export_payload, indent=2),
+            file_name=f"weather_market_signals_{sig_city.replace(' ', '_').lower()}.json",
+            mime="application/json",
+        )
 
 
 # ===========================================================================
