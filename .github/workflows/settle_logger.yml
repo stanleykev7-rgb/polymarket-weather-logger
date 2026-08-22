@@ -1,15 +1,24 @@
-name: Daily Outcome Settler
+name: Outcome Settler
 
 on:
   schedule:
-    - cron: '0 4 * * *' # Runs daily at 04:00 UTC
+    # FIX (2026-08): was once daily (04:00 UTC only), which meant a
+    # market could sit "unsettled" in the dashboard for up to ~24h after
+    # it actually resolved, purely from run-frequency lag -- not a data
+    # problem, just staleness. Now every 4 hours. Safe to run this often
+    # because settle_outcomes.py now skips re-querying any (city, date)
+    # pair that already has a confirmed OFFICIAL result (see its
+    # PERFORMANCE FIX note) -- so more frequent runs mostly do very
+    # little extra work, they just catch newly-resolved dates sooner.
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 # Prevents this workflow from racing against ITSELF if triggered twice
-# close together (e.g. a manual run overlapping the scheduled one).
+# close together (e.g. a manual run overlapping a scheduled one, more
+# likely now that it runs every 4 hours instead of once a day).
 # It does NOT prevent races against the separate Hourly Weather Logger
 # workflow -- that's handled by the retry-with-rebase push below instead,
 # since we don't want the daily settlement job blocked for up to an hour
