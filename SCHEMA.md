@@ -408,3 +408,38 @@ within [0,1]); confirmed hit_rate always falls within its own CI across
 (explicit int()/float() casts avoid the common numpy-dtype
 serialization failure); tested empty-data, impossible-filter-threshold,
 and single-city-scope edge cases, all handled without crashing.
+
+## Settlement frequency increased + skip-optimization (2026-08)
+
+**Question**: does running settlement more than once a day cause storage
+or API-limit problems?
+
+**Answer**: no meaningful downside, with one real fix made first.
+Running settlement more often does NOT produce more distinct-market
+samples faster (that's bounded by real calendar days passing,
+~1/city/day at most) -- it only reduces LATENCY, i.e. how long a
+market sits "unsettled" in the dashboard after it actually resolved in
+the real world.
+
+**Fix made before increasing frequency**: `settle_outcomes.py` was
+re-querying every (city, target_date) pair EVER seen in the log, on
+every single run -- including pairs already confirmed via an official
+source in a prior run. This waste only grows as history accumulates,
+and would have multiplied with a more frequent schedule. Now: any pair
+that already has a confirmed OFFICIAL result (NOAA/HKO -- ground truth,
+won't change) is loaded from the previous evaluated CSV and skipped;
+only proxy-only or still-unresolved pairs get re-checked each run
+(since those can still be upgraded or filled in for the first time).
+Verified across a two-run test: run 2 correctly made zero API calls for
+an already-officially-settled city while still checking an
+unresolved one, and both cities' data was correctly preserved in the
+output.
+
+**Schedule change**: `settle_logger.yml` moved from once daily (04:00
+UTC) to every 4 hours (`0 */4 * * *`). Since the repo is public,
+GitHub Actions minutes are unlimited and free regardless. NOAA, HKO,
+and Open-Meteo are all well-documented free public APIs with generous
+rate limits relative to this project's request volume (14 cities,
+worst case a few hundred requests per run before the skip-optimization
+reduces it further over time) -- 6 runs/day is comfortably within
+normal, courteous usage for all three.

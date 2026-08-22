@@ -187,11 +187,51 @@ def verify_and_settle():
   proxy_results = {}
   official_results = {}
 
+  # PERFORMANCE FIX (2026-08): previously re-queried EVERY (city,
+  # target_date) pair ever seen in the entire log, on every single run
+  # -- including dates that already had a confirmed OFFICIAL settlement
+  # from a prior run. That waste only grows as history accumulates, and
+  # becomes a real concern if this script runs more than once a day.
+  #
+  # Now: any pair that already has an OFFICIAL result (NOAA/HKO -- our
+  # ground truth, which won't change) is loaded from the PREVIOUS
+  # evaluated CSV and skipped in the fetch loop below, rather than
+  # re-fetched. Anything proxy-only or still unresolved is always
+  # re-checked, since those can still be upgraded (official sources
+  # sometimes finalize later than the proxy) or filled in for the first
+  # time.
+  already_official = set()
+  if os.path.exists(EVALUATED_CSV):
+    try:
+      prev = pd.read_csv(EVALUATED_CSV, usecols=lambda c: c in {
+          "city", "target_date", "actual_max_c_official",
+          "actual_max_c_openmeteo_proxy", "settlement_source",
+      })
+      prev_official = prev[prev["actual_max_c_official"].notna()]
+      for _, r in prev_official.iterrows():
+        key = (r["city"], str(r["target_date"]))
+        official_results[key] = (r["actual_max_c_official"], r.get("settlement_source"))
+        if pd.notna(r.get("actual_max_c_openmeteo_proxy")):
+          proxy_results[key] = r["actual_max_c_openmeteo_proxy"]
+        already_official.add(key)
+    except Exception as e:
+      print(f"[settle_outcomes] Could not read prior evaluated CSV for skip-optimization ({e}) -- checking all pairs fresh.")
+
+  targets_to_check = unique_targets[
+      ~unique_targets.apply(lambda r: (r["city"], str(r["target_date"])) in already_official, axis=1)
+  ]
+  if already_official:
+    print(
+        f"Skipping {len(already_official)} already-officially-settled (city, date) pairs "
+        f"(carried forward from prior run) -- checking {len(targets_to_check)} of "
+        f"{len(unique_targets)} total pairs fresh this run."
+    )
+
   print(
       "Fetching actual outcomes: official source where available (NOAA/HKO),"
       " Open-Meteo Archive proxy for every city as a cross-check/fallback..."
   )
-  for _, row in unique_targets.iterrows():
+  for _, row in targets_to_check.iterrows():
     city = row["city"]
     target_date = str(row["target_date"])
 
