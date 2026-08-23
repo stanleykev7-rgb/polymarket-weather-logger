@@ -15,24 +15,31 @@ from official_settlement_sources import fetch_official_actual_max_c
 INPUT_CSV = "polymarket_weather_live_log.csv"
 EVALUATED_CSV = "polymarket_weather_evaluated.csv"
 
-# --- SETTLEMENT SOURCE NOTE (2026-08 audit, updated) --------------------
+# --- SETTLEMENT SOURCE NOTE (2026-08 audit, updated a second time) -----
 # Confirmed by reading live Polymarket market rules pages: the official
 # resolution source per city is a named station feed -- Wunderground
 # (specific airport station per city) for most cities, and the Hong Kong
 # Observatory's own daily extract for Hong Kong specifically.
 #
-# As of this update, REAL official sources are wired in for 4 of 14
-# cities (see official_settlement_sources.py):
+# As of this update, REAL official (or official-equivalent) sources are
+# wired in for ALL 14 cities (see official_settlement_sources.py):
 #   - New York (KLGA), Chicago (KORD), Miami (KMIA) via NOAA/NWS
 #     api.weather.gov -- the same underlying ASOS/METAR feed Wunderground
 #     displays for these airport stations.
 #   - Hong Kong via HKO's own public open data API.
+#   - The remaining 10 cities (Tokyo, Shanghai, Qingdao, Seoul, Guangzhou,
+#     Shenzhen, London, Paris, Ankara, Buenos Aires) via direct METAR
+#     reports from NOAA's aviationweather.gov Data API, which covers
+#     international ICAO stations. Same underlying idea as the NOAA
+#     cities above -- Wunderground's airport-station table is itself
+#     built from METAR -- just fetched via a different NOAA endpoint that
+#     has global rather than US-only coverage. METAR is also the
+#     FASTEST-updating source available here (~hourly), labeled
+#     `metar_aviationweather` in `settlement_source`.
 #
-# The remaining 10 cities have no verified non-Wunderground public
-# equivalent yet, and continue to use the Open-Meteo Archive reanalysis
-# proxy. Every row's `settlement_source` column says exactly which path
-# was used, and `actual_max_c_openmeteo_proxy` is ALWAYS computed
-# regardless (even for the 4 official cities) so you can cross-check the
+# Every row's `settlement_source` column says exactly which path was
+# used, and `actual_max_c_openmeteo_proxy` is ALWAYS computed regardless
+# (even for officially-settled cities) so you can cross-check the
 # proxy's accuracy against real data as it accumulates.
 CITIES = {
     # Coordinates updated 2026-08 to match Polymarket's exact named
@@ -228,7 +235,7 @@ def verify_and_settle():
     )
 
   print(
-      "Fetching actual outcomes: official source where available (NOAA/HKO),"
+      "Fetching actual outcomes: official source where available (NOAA/HKO/METAR),"
       " Open-Meteo Archive proxy for every city as a cross-check/fallback..."
   )
   for _, row in targets_to_check.iterrows():

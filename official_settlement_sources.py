@@ -10,32 +10,52 @@ Confirmed by directly reading multiple live Polymarket market rules pages
   Chicago       Wunderground -> O'Hare Intl Airport Station   KORD
   Miami         Wunderground -> Miami Intl Airport Station    KMIA
   Hong Kong     Hong Kong Observatory (NOT Wunderground)      HKO HQ
+  Tokyo         Wunderground -> Haneda Airport                RJTT
+  Shanghai      Wunderground -> Pudong Intl Airport           ZSPD
+  Qingdao       Wunderground -> Jiaodong Intl Airport         ZSQD
+  Seoul         Wunderground -> Incheon Intl Airport          RKSI
+  Guangzhou     Wunderground -> Baiyun Intl Airport           ZGGG
+  Shenzhen      Wunderground -> Bao'an Intl Airport           ZGSZ
+  London        Wunderground -> London City Airport           EGLC
+  Paris         Wunderground -> Le Bourget Airport            LFPB
+  Ankara        Wunderground -> Esenboğa Intl Airport         LTAC
+  Buenos Aires  Wunderground -> Ezeiza Intl Airport           SAEZ
 
 Rules text also specifies: "highest temperature recorded in the 'Daily
 Observations' table ... not the ... 'Day High & Low' summary" -- i.e.
 the max across all individual sub-daily observations for the station's
-local calendar day. That's exactly what fetch_noaa_daily_max_c below
-computes (max of all METAR/ASOS observations for the local day), using
-the SAME underlying instrument feed Wunderground displays for these
-airport stations (both ultimately source from the NWS/FAA ASOS network
-for these station codes).
+local calendar day.
 
-WHAT THIS DOES NOT COVER YET:
-Tokyo, Shanghai, Qingdao, Seoul, Guangzhou, Shenzhen, London, Paris,
-Ankara, and Buenos Aires all resolve via Wunderground too, but Wunderground
-itself has no public, documented API for non-US stations, and no
-government-run equivalent was verified for all of them in this pass.
-Scraping Wunderground's site directly is possible but fragile (their
-page is JS-rendered; any workable approach depends on an undocumented
-internal endpoint that can change without notice) and was intentionally
-NOT implemented here rather than shipping something unverified. These
-cities continue to use the Open-Meteo proxy, clearly labeled as such in
-`settlement_source`. See SCHEMA.md.
+--- METAR SOURCE (added 2026-08, second pass) --------------------------
+For every station above except HKO (which isn't an airport and has its
+own direct government source instead), Wunderground's "Daily
+Observations" table for an airport station is itself built from that
+station's raw METAR feed. Rather than only covering the 3 US cities via
+NOAA's api.weather.gov, fetch_metar_daily_max_c below queries
+aviationweather.gov's official Data API (run by the same agency,
+NOAA/NWS -- see https://aviationweather.gov/data/api/) directly for the
+underlying METAR reports, which covers international ICAO stations too
+(their own docs example a London City Airport query). This extends
+real official-equivalent settlement from 4 cities to potentially all 14.
+
+METAR reports are also the FASTEST-updating source available to this
+project -- typically hourly (sometimes more often at busier airports),
+versus reanalysis products like Open-Meteo Archive which have their own
+processing/publication lag. Rows settled via METAR are labeled
+`metar_aviationweather` in `settlement_source` so this is visible in
+the data, not just in this comment.
+
+Priority order per city (see fetch_official_actual_max_c): the 3 NOAA
+cities and Hong Kong keep their existing direct-government-API sources
+unchanged (no reason to replace something already working with a
+same-underlying-data alternative). Every other city now tries METAR via
+aviationweather.gov before falling back to the Open-Meteo proxy.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -51,6 +71,40 @@ NOAA_STATIONS = {
 }
 
 HKO_STATION = "HKO"  # Hong Kong Observatory headquarters
+
+# ICAO codes for every remaining city, confirmed via the same rules-page
+# research (see SCHEMA.md for the full per-city source table).
+METAR_STATIONS = {
+    "Tokyo": "RJTT",
+    "Shanghai": "ZSPD",
+    "Qingdao": "ZSQD",
+    "Seoul": "RKSI",
+    "Guangzhou": "ZGGG",
+    "Shenzhen": "ZGSZ",
+    "London": "EGLC",
+    "Paris": "LFPB",
+    "Ankara": "LTAC",
+    "Buenos Aires": "SAEZ",
+}
+
+# Standard WMO METAR temperature/dewpoint group, e.g. " 13/07 " or
+# " M05/M10 " (M prefix = negative). Used as a fallback if the API's
+# decoded `temp` field is absent for a given report -- this text format
+# is a stable international standard, not expected to change.
+_METAR_TEMP_RE = re.compile(r"(?:^|\s)(M?\d{2})/(M?\d{2})(?:\s|$)")
+
+
+def _parse_metar_temp_c(raw_ob: str) -> float | None:
+    if not raw_ob:
+        return None
+    m = _METAR_TEMP_RE.search(raw_ob)
+    if not m:
+        return None
+    temp_str = m.group(1)
+    try:
+        return -float(temp_str[1:]) if temp_str.startswith("M") else float(temp_str)
+    except ValueError:
+        return None
 
 
 def _local_day_utc_bounds(target_date_str: str, iana_tz: str) -> tuple[datetime, datetime]:
@@ -148,15 +202,82 @@ def fetch_hko_daily_max_c(target_date_str: str, timeout: int = 15) -> float | No
         return None
 
 
+def fetch_metar_daily_max_c(
+    icao_station: str, target_date_str: str, iana_tz: str, timeout: int = 15
+) -> float | None:
+    """Max observed temperature (°C) for the station's LOCAL calendar day,
+    from every METAR report issued during that window, via NOAA's public
+    aviationweather.gov Data API (no API key required; rate limit is a
+    generous 100 requests/minute, confirmed via their own docs).
+
+    Prefers the API's decoded `temp` field per report; falls back to
+    regex-parsing the raw METAR text's standard temperature group if
+    `temp` is missing for a given report (rare, but AUTO/partial reports
+    can omit it). Returns None (never raises) on any failure, so the
+    caller can fall back further to the Open-Meteo proxy.
+
+    NOTE: aviationweather.gov's documented history window is the past
+    ~15 days -- more than enough for same-day/next-day settlement, but
+    this will NOT work for retroactively backfilling older rows.
+    """
+    try:
+        start_utc, end_utc = _local_day_utc_bounds(target_date_str, iana_tz)
+        hours_back = (end_utc - start_utc).total_seconds() / 3600.0 + 1  # +1 margin
+        url = (
+            "https://aviationweather.gov/api/data/metar"
+            f"?ids={icao_station}&format=json"
+            f"&date={end_utc.strftime('%Y%m%d_%H%M')}"
+            f"&hours={hours_back:.0f}"
+        )
+        res = requests.get(url, timeout=timeout)
+        if res.status_code != 200:
+            return None
+        reports = res.json()
+        if not isinstance(reports, list):
+            return None
+
+        temps = []
+        for report in reports:
+            obs_time_str = report.get("obsTime") or report.get("reportTime")
+            # Confirm this specific report actually falls within the
+            # target LOCAL day -- the API's date/hours params bound the
+            # query window but individual report timestamps should
+            # still be checked against the precise UTC boundary.
+            obs_dt = None
+            if isinstance(obs_time_str, (int, float)):
+                obs_dt = datetime.fromtimestamp(obs_time_str, tz=ZoneInfo("UTC"))
+            elif isinstance(obs_time_str, str):
+                try:
+                    obs_dt = datetime.fromisoformat(obs_time_str.replace("Z", "+00:00"))
+                except ValueError:
+                    obs_dt = None
+            if obs_dt is not None and not (start_utc <= obs_dt < end_utc):
+                continue
+
+            t = report.get("temp")
+            if t is None:
+                t = _parse_metar_temp_c(report.get("rawOb", ""))
+            if t is not None:
+                temps.append(float(t))
+
+        if not temps:
+            return None
+        return round(max(temps), 2)
+    except Exception as e:
+        print(f"[official_settlement_sources] METAR fetch failed for {icao_station} {target_date_str}: {e}")
+        return None
+
+
 def fetch_official_actual_max_c(
     city: str, target_date_str: str, iana_tz: str
 ) -> tuple[float | None, str | None]:
-    """Dispatch to the right official fetcher for `city`, if one exists.
+    """Dispatch to the right official (or official-equivalent) fetcher
+    for `city`, if one exists.
 
     Returns (value_c, source_label). value_c is None and source_label is
-    None if no official fetcher is implemented for this city yet, or if
-    the fetch failed -- callers should fall back to the proxy in either
-    case.
+    None if no fetcher is implemented for this city yet, or if every
+    attempted fetch failed -- callers should fall back to the Open-Meteo
+    proxy in either case.
     """
     if city in NOAA_STATIONS:
         val = fetch_noaa_daily_max_c(NOAA_STATIONS[city], target_date_str, iana_tz)
@@ -164,4 +285,7 @@ def fetch_official_actual_max_c(
     if city == "Hong Kong":
         val = fetch_hko_daily_max_c(target_date_str)
         return (val, "hko_opendata") if val is not None else (None, None)
+    if city in METAR_STATIONS:
+        val = fetch_metar_daily_max_c(METAR_STATIONS[city], target_date_str, iana_tz)
+        return (val, "metar_aviationweather") if val is not None else (None, None)
     return None, None

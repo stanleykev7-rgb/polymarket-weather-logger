@@ -443,3 +443,60 @@ rate limits relative to this project's request volume (14 cities,
 worst case a few hundred requests per run before the skip-optimization
 reduces it further over time) -- 6 runs/day is comfortably within
 normal, courteous usage for all three.
+
+## Settlement coverage extended from 4 to all 14 cities via METAR (2026-08)
+
+**Idea origin**: user pointed out ogimet.com as a fast-updating METAR
+source. Investigated further and found a better option: NOAA's own
+official `aviationweather.gov` Data API, which covers international
+ICAO stations (not just US), needs no API key, and allows 100
+requests/minute.
+
+**Why this works**: Wunderground's "Daily Observations" table for an
+airport station (the actual Polymarket resolution source per earlier
+research) is itself built from that station's raw METAR feed. Since 13
+of our 14 cities already have a confirmed exact ICAO code (see the
+coordinate-precision fix earlier in this doc), fetching METAR directly
+gives real official-equivalent settlement for all of them.
+
+**New**: `fetch_metar_daily_max_c()` in `official_settlement_sources.py`
+queries `aviationweather.gov/api/data/metar`, takes the max temperature
+across every report within the target station's LOCAL calendar day.
+Prefers the API's decoded `temp` field; falls back to regex-parsing the
+raw METAR text's standard temperature group (handles negative temps,
+`M05` = -5°C) if `temp` is missing for a given report. Labeled
+`metar_aviationweather` in `settlement_source`.
+
+**Coverage now**: all 14 cities have an official or official-equivalent
+settlement source — NOAA/NWS (NYC, Chicago, Miami), HKO (Hong Kong), and
+METAR via aviationweather.gov (the remaining 10). The Open-Meteo proxy
+is now purely a fallback for when a specific fetch fails, not the
+primary source for any city. `actual_max_c_openmeteo_proxy` is still
+always computed regardless, so proxy-vs-official accuracy remains
+cross-checkable as more data accumulates.
+
+**METAR is also the fastest-updating source available to this
+project** (~hourly reports, vs. reanalysis products with their own
+processing lag) — explicitly labeled as such in code comments and
+surfaced in the dashboard.
+
+**New dashboard section**: "Settlement Source Coverage" in the Data
+Quality tab shows exactly which source settled each city's rows (row
+counts per city per source), so this is visible in the UI, not just in
+a column you'd have to know to look for.
+
+**Verified**: METAR text regex parser tested against real-format
+examples including a negative-temperature case (M05 → -5.0°C, correct).
+Full fetch function tested with mocked multi-report responses:
+correctly excludes a report just outside the target local day's UTC
+boundary, correctly uses the raw-text fallback parse when it's the
+genuine maximum (not just present but ignored), correctly returns None
+on request failure. End-to-end settlement test confirmed a
+METAR-settled city and a proxy-fallback city both produce correct,
+correctly-labeled output in the same run.
+
+**Known limitation carried over from the API itself**:
+aviationweather.gov's documented history window is the past ~15 days —
+sufficient for same-day/next-day settlement (how this project uses it)
+but not for retroactively backfilling old unsettled rows once that
+window has passed.

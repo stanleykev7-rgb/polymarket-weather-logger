@@ -814,6 +814,38 @@ with tab_quality:
     else:
         st.caption("data_quality column not available for this data.")
 
+    st.divider()
+    st.subheader("Settlement Source Coverage")
+    st.caption(
+        "Which source actually settled each city's rows. METAR (via NOAA's "
+        "aviationweather.gov) and NOAA/HKO are official or official-equivalent "
+        "sources, sourced directly from the station Polymarket names as its "
+        "resolution source. METAR updates the fastest (~hourly). The "
+        "Open-Meteo proxy is a fallback used only when no official source "
+        "succeeded for that specific row."
+    )
+    if has_col(df, "settlement_source"):
+        SOURCE_LABELS = {
+            "noaa_nws": "NOAA/NWS (official)",
+            "hko_opendata": "Hong Kong Observatory (official)",
+            "metar_aviationweather": "METAR via aviationweather.gov (official, fastest-updating)",
+            "openmeteo_archive_proxy_fallback": "Open-Meteo Archive (proxy fallback)",
+        }
+        src = df[["city", "settlement_source"]].dropna(subset=["settlement_source"])
+        if src.empty:
+            st.caption("No settled rows with a recorded settlement source yet.")
+        else:
+            summary = (
+                src.groupby(["city", "settlement_source"]).size()
+                .reset_index(name="rows")
+                .sort_values(["city", "rows"], ascending=[True, False])
+            )
+            summary["Source"] = summary["settlement_source"].map(SOURCE_LABELS).fillna(summary["settlement_source"])
+            display = summary[["city", "Source", "rows"]].rename(columns={"city": "City", "rows": "Settled Rows"})
+            st.dataframe(display, use_container_width=True, hide_index=True)
+    else:
+        st.caption("settlement_source column not available for this data (older schema rows, or nothing settled yet).")
+
 
 # ===========================================================================
 # TAB: Performance Report
