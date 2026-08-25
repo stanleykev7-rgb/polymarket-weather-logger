@@ -500,3 +500,62 @@ aviationweather.gov's documented history window is the past ~15 days —
 sufficient for same-day/next-day settlement (how this project uses it)
 but not for retroactively backfilling old unsettled rows once that
 window has passed.
+
+## Validation + "Act Now" indicator (2026-08)
+
+Added to `signal_analysis.py`, in response to "which of these signals can I actually trust":
+
+**`compute_validation()`** — a split-half replication check. Divides
+settled data chronologically at the median distinct target_date, computes
+signal candidates separately in each half, and checks whether a
+(city, model, window) cell's edge points the **same direction** in both
+halves. Deliberately simple (not a full rolling k-fold backtest) --
+appropriate for an early-stage, small dataset; the split point is just
+the median date, so this naturally gets more statistical power as more
+days accumulate with zero code changes. A cell only gets a real
+`true`/`false` verdict if BOTH halves clear a minimum distinct-market
+count on their own; otherwise `replicated` is `null` ("not enough data
+to judge"), which is explicitly different from "failed to replicate."
+
+**`find_actionable_now()`** — the "Act Now" indicator. Identifies
+currently-OPEN (not yet settled) markets, computes each one's LIVE
+hours-to-resolution (recomputed as of right now, not read from a stale
+historical row), and surfaces any that fall inside a window with a
+`replicated=true`, positive edge for some model in that city. Shows
+which model is favored and its current forecast/price for context --
+still descriptive, not an instruction.
+
+**Dashboard**: "🔔 Act Now" banner at the top of the Signal Analysis tab;
+a "Replicated?" column added to the Signal Candidates table; the JSON
+export now includes replication status (with `edge_a`/`edge_b` per
+half) so "which signals are actually validated" travels with the export,
+not just the raw candidate list.
+
+**Verified**: constructed test data with a KNOWN ground truth --
+one (city, model, window) with a stable edge in both halves (correctly
+flagged `replicated=true`), one where the edge flips sign between
+halves (correctly flagged `false`), and one with too few distinct
+dates in one half (correctly flagged `null`, not a misleading verdict).
+`find_actionable_now` tested against a currently-open market in a
+matching validated window (correctly surfaced, with live forecast
+context attached) and three negative cases -- open market outside the
+matched window, no open markets at all, and an empty validation table
+-- all correctly returned empty rather than a false positive. JSON
+export serialization re-verified with the new `bool`/`None` fields
+mixed in.
+
+## Backfill research (2026-08) -- investigated, not yet built
+
+Checked feasibility of backfilling historical (forecast, price, outcome)
+triples to accelerate past the current small-sample-size stage:
+
+- **Polymarket historical prices**: real and free --
+  `clob.polymarket.com/prices-history`, no auth required.
+- **Historical forecasts**: also real -- Open-Meteo's "Previous Runs API"
+  archives forecasts at fixed lead-time offsets (1-7 days ahead), back to
+  January 2024 for most models, March 2021 for GFS.
+- **Open question, not yet checked**: how far back Polymarket actually
+  ran these specific 14-city temperature markets. This is now the
+  binding constraint, not the weather data. Needs checking
+  market-by-market before committing to building a backfill pipeline --
+  flagged as a candidate next step, not started.

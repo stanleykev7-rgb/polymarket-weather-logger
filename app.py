@@ -6,6 +6,7 @@ import streamlit as st
 
 import report_builder as rb
 import signal_analysis as sa
+from weather_collector import CITIES as CITY_INFO
 
 st.set_page_config(
     page_title="PolyMarket Weather Data Explorer",
@@ -713,6 +714,37 @@ with tab_signals:
         "confidence intervals and sample sizes, then decide for yourself."
     )
 
+    city_tz_map = {c: info["tz"] for c, info in CITY_INFO.items()}
+    validation_all = sa.compute_validation(df, city=None)
+    actionable_now = sa.find_actionable_now(df, validation_all, city_tz_map)
+
+    st.subheader("🔔 Act Now")
+    st.caption(
+        "Currently-open markets whose time-to-resolution right now falls inside a "
+        "window that passed a split-half replication check (see 'Replicated?' below) "
+        "with a positive edge for some model in this city. Shows what's historically "
+        "favored and why -- not an instruction."
+    )
+    if actionable_now.empty:
+        st.info("Nothing currently matches a replicated, positive-edge window. This is expected often, especially early on.")
+    else:
+        for _, r in actionable_now.sort_values("edge_a", key=lambda s: s.abs(), ascending=False).iterrows():
+            dot_color = MODEL_COLORS.get(r["model"], "#888")
+            avg_edge = (r["edge_a"] + r["edge_b"]) / 2 * 100
+            bucket_str = f' — currently forecasting <b>{r["current_model_bucket"]}</b>' if pd.notnull(r.get("current_model_bucket")) else ""
+            price_str = f' (priced at {r["current_model_price"]*100:.0f}%)' if pd.notnull(r.get("current_model_price")) else ""
+            st.markdown(
+                f'<div class="metric-card" style="margin-bottom:8px;">'
+                f'<span class="heat-dot" style="background:{dot_color};"></span>'
+                f'<b>{r["city"]}, {r["target_date"]}</b> — {r["model"]} has a replicated +{avg_edge:.0f}pp edge in the '
+                f'<b>{r["window"]}</b> window (currently {r["hours_to_resolution_now"]:.1f}h to resolution)'
+                f'{bucket_str}{price_str}.</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+    st.subheader("Signal Candidates")
+
     sig_col1, sig_col2, sig_col3 = st.columns([1, 1, 1])
     with sig_col1:
         sig_city = st.selectbox("Scope", options=["All Cities"] + all_cities, key="sig_city")
@@ -726,11 +758,19 @@ with tab_signals:
 
     sig_city_arg = None if sig_city == "All Cities" else sig_city
     candidates = sa.compute_signal_candidates(df, city=sig_city_arg)
+    validation_scope = sa.compute_validation(df, city=sig_city_arg)
 
     if candidates.empty:
         st.info("No settled data with resolution-time info yet for this scope.")
     else:
         filtered = candidates[candidates["n_distinct_markets"] >= sig_min_n].copy()
+        if not validation_scope.empty:
+            filtered = filtered.merge(
+                validation_scope[["city", "model", "window", "replicated"]],
+                on=["city", "model", "window"], how="left",
+            )
+        else:
+            filtered["replicated"] = None
         if sig_sort == "Edge (largest magnitude first)":
             filtered = filtered.sort_values("edge", key=lambda s: s.abs(), ascending=False)
         else:
@@ -751,6 +791,8 @@ with tab_signals:
                 edge_str = f'{"+" if edge_pp >= 0 else ""}{edge_pp:.0f}pp' if edge_pp is not None else "—"
                 ci_str = f'[{r["ci_low"]*100:.0f}-{r["ci_high"]*100:.0f}%]' if pd.notnull(r["ci_low"]) else ""
                 baseline_str = f'{r["market_price_mean"]*100:.0f}%' if pd.notnull(r["market_price_mean"]) else "—"
+                rep = r.get("replicated")
+                rep_str = "✅ Yes" if rep is True else ("❌ No" if rep is False else "— not enough data")
                 rows_html += (
                     '<tr>'
                     f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF;">{r["city"]}</td>'
@@ -763,13 +805,14 @@ with tab_signals:
                     f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; font-weight:600;">{edge_str}</td>'
                     f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{r["n_rows"]}</td>'
                     f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{r["n_distinct_markets"]}</td>'
+                    f'<td style="padding:10px; border-bottom:0.5px solid #E5E4DF; color:#6B6A66;">{rep_str}</td>'
                     '</tr>'
                 )
             header_html = (
                 '<tr>' + "".join(
                     f'<th style="text-align:left; padding:8px 10px; color:#8A8983; font-weight:400; '
                     f'border-bottom:0.5px solid #E5E4DF;">{h}</th>'
-                    for h in ["City", "Model", "Window", "Hit Rate (95% CI)", "Avg Market Price", "Edge", "n rows", "n markets"]
+                    for h in ["City", "Model", "Window", "Hit Rate (95% CI)", "Avg Market Price", "Edge", "n rows", "n markets", "Replicated?"]
                 ) + '</tr>'
             )
             st.markdown(
@@ -781,13 +824,16 @@ with tab_signals:
                 "percentage points (pp). Positive = this model beat the market's pricing in this sample; "
                 "negative = the opposite. n rows = row-level observations (may include repeated hourly "
                 "looks at the same still-resolving market). n markets = distinct (city, date) markets -- "
-                "the more conservative number, and what the slider above filters on."
+                "the more conservative number, and what the slider above filters on. Replicated = does the "
+                "edge point the same direction in both halves of the collection period (a split-half check, "
+                "see SCHEMA.md) -- '— not enough data' means each half needs more distinct markets before "
+                "this can be judged either way."
             )
 
         st.divider()
         st.subheader("Export")
         st.caption("Downloads the full signal table (before the sample-size filter above) as JSON, with a methodology block explaining every field -- suitable for a human analyst or another AI agent to consume without additional context.")
-        export_payload = sa.build_signal_export(candidates, min_n=sig_min_n, city_scope=sig_city)
+        export_payload = sa.build_signal_export(candidates, min_n=sig_min_n, city_scope=sig_city, validation=validation_scope)
         st.download_button(
             "Download signals (JSON)",
             data=json.dumps(export_payload, indent=2),
