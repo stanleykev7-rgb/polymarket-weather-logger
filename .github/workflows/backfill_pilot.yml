@@ -1,0 +1,26 @@
+name: Backfill Pilot (manual)
+
+on:
+  workflow_dispatch:  # ONLY runs when you click "Run workflow" in the Actions tab -- no schedule
+
+permissions:
+  contents: write
+
+jobs:
+  backfill-pilot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install requests pandas
+      - name: Run backfill pilot
+        run: python backfill_pilot.py
+      - name: Commit pilot output (if it was created)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add polymarket_weather_backfill_pilot.csv 2>/dev/null || true
+          git commit -m "Backfill pilot run [skip ci]" || echo "Nothing to commit (pilot may have produced 0 rows -- check the log above)"
+          git push
