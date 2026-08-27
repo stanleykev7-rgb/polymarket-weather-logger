@@ -151,14 +151,28 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity_min:
 
 
 def fetch_previous_runs(lat: float, lon: float, tz: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """ONE call covering the whole date range -- returns a daily time
-    series with columns like temperature_2m_max_ecmwf_ifs025_previous_day1,
-    _previous_day2, etc. for both ECMWF and GFS.
+    """ONE call covering the whole date range.
+
+    FIX (real error from a live run): originally requested variable
+    names with the model suffix baked in
+    (temperature_2m_max_ecmwf_ifs025_previous_day1), which Open-Meteo
+    rejected outright (HTTP 400, "Cannot initialize ForecastVariableDaily
+    from invalid String value"). Confirmed via Open-Meteo's own example
+    that the correct pattern is the BASE variable name +
+    _previous_dayN, with NO model name in the requested variable --
+    exactly the same convention weather_collector.py already uses
+    correctly for the regular forecast endpoint (request
+    `temperature_2m_max`, models are a separate `models=` parameter,
+    and the RESPONSE comes back with model-suffixed keys).
+
+    The exact response column naming for the previous-runs endpoint
+    specifically hasn't been confirmed against a live call yet, so the
+    caller (run_pilot) takes whatever columns actually come back
+    generically rather than assuming a specific name -- if this is
+    still slightly off, the next run's printed column list will show
+    exactly what to fix instead of failing blind a second time.
     """
-    daily_vars = []
-    for model_suffix in ["ecmwf_ifs025", "gfs_seamless"]:
-        for d in LEAD_DAYS:
-            daily_vars.append(f"temperature_2m_max_{model_suffix}_previous_day{d}")
+    daily_vars = [f"temperature_2m_max_previous_day{d}" for d in LEAD_DAYS]
 
     try:
         res = requests.get(
@@ -179,6 +193,7 @@ def fetch_previous_runs(lat: float, lon: float, tz: str, start_date: str, end_da
         if not daily or "time" not in daily:
             print("    [open-meteo previous-runs] Unexpected response shape, no 'daily.time' found.")
             return pd.DataFrame()
+        print(f"    [open-meteo previous-runs] response columns: {list(daily.keys())}")
         return pd.DataFrame(daily)
     except Exception as e:
         print(f"    [open-meteo previous-runs] fetch failed: {e}")

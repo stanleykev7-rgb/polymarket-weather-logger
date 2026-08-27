@@ -604,3 +604,27 @@ breaks before this scales to all 14 cities. Likely rough edges: exact
 Gamma closed-event query shape, whether `clobTokenIds` ordering
 assumptions hold in practice, and how cleanly CLOB price timestamps
 align with previous-run forecast dates.
+
+## Backfill pilot: first live run caught a real bug, fixed (2026-08)
+
+**Real error from your first live run**: Open-Meteo rejected the
+requested `daily=` variable names with HTTP 400 ("Cannot initialize
+ForecastVariableDaily from invalid String value..."). Root cause: the
+pilot requested variable names with the model suffix baked directly in
+(`temperature_2m_max_ecmwf_ifs025_previous_day1`), but Open-Meteo's
+Previous Runs API wants the BASE variable name only
+(`temperature_2m_max_previous_day1`), with the model specified
+separately via `models=` -- exactly the same convention
+`weather_collector.py` already used correctly for the regular forecast
+endpoint. Fixed in `fetch_previous_runs()`.
+
+Also added a diagnostic print of the actual response column names
+right after a successful fetch, so if there's still any naming
+mismatch on the next run, it shows up as concrete evidence in the log
+instead of another guess.
+
+**Re-verified** the fixed request against a mocked response (confirmed
+the outgoing `daily` param has no model suffix, `models` is sent
+separately) and re-ran the full end-to-end pilot test -- unchanged
+behavior otherwise, correctly produced 4 rows from a 14-day window with
+a mix of resolved/unresolved dates.
