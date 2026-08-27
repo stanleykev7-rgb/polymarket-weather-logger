@@ -559,3 +559,48 @@ triples to accelerate past the current small-sample-size stage:
   binding constraint, not the weather data. Needs checking
   market-by-market before committing to building a backfill pipeline --
   flagged as a candidate next step, not started.
+
+## Backfill pilot script built (2026-08)
+
+Following the feasibility research above, built `backfill_pilot.py` --
+Tokyo only, last 14 days, a manually-run one-time script (NOT part of
+the hourly/daily automation). Confirmed all three source APIs with
+current documentation before writing code:
+
+- **Polymarket price history**: `clob.polymarket.com/prices-history`,
+  params `market` (CLOB token ID), `startTs`/`endTs`, `fidelity`
+  (minutes). Found a real reported issue (Polymarket/py-clob-client#216)
+  that resolved markets can silently return empty data below 12-hour
+  fidelity -- the pilot requests 720-minute fidelity specifically to
+  stay within what's confirmed to work.
+- **Historical forecasts**: Open-Meteo's Previous Runs API
+  (`previous-runs-api.open-meteo.com`) -- more efficient than expected:
+  ONE call per city covers the entire date range (not one call per
+  day), returning `_previous_dayN` fields (N=1-7) for whichever models
+  are requested. Archived from January 2024, comfortably before this
+  project's March 2026 market-history start.
+- **Market history depth**: confirmed ~5.5 months (back to
+  early-to-mid March 2026) across three deliberately different cities
+  (Tokyo, Miami, Ankara) via direct evidence from live market pages --
+  strong signal this is platform-wide, not staggered per city, though
+  not exhaustively confirmed for all 14.
+
+**Output**: `polymarket_weather_backfill_pilot.csv`, tagged
+`_schema_version = "backfill_pilot_v1"` -- never touches the live
+collector's files.
+
+**Verified via mocking** (no live network access in the dev sandbox):
+resolution/winning-bucket extraction against a realistic simulated
+Gamma event, previous-runs response parsing (success and failure
+paths), and the full `run_pilot()` orchestration end-to-end with a
+mixed resolved/unresolved-date scenario -- correctly skipped
+unresolved dates, correctly pulled prices only for resolved ones,
+correctly wrote a clean output file.
+
+**What's genuinely unverified**: actually calling these three APIs
+together against the real, live internet. This is flagged honestly in
+the script's own docstring -- run it for real and report back what
+breaks before this scales to all 14 cities. Likely rough edges: exact
+Gamma closed-event query shape, whether `clobTokenIds` ordering
+assumptions hold in practice, and how cleanly CLOB price timestamps
+align with previous-run forecast dates.
