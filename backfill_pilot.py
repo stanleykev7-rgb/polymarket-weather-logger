@@ -150,38 +150,42 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity_min:
     return []
 
 
-def fetch_previous_runs(lat: float, lon: float, tz: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """ONE call covering the whole date range.
+def fetch_previous_runs(lat: float, lon: float, tz: str, past_days: int) -> pd.DataFrame:
+    """ONE call covering the trailing `past_days` days.
 
-    FIX (real error from a live run): originally requested variable
-    names with the model suffix baked in
-    (temperature_2m_max_ecmwf_ifs025_previous_day1), which Open-Meteo
-    rejected outright (HTTP 400, "Cannot initialize ForecastVariableDaily
-    from invalid String value"). Confirmed via Open-Meteo's own example
-    that the correct pattern is the BASE variable name +
-    _previous_dayN, with NO model name in the requested variable --
-    exactly the same convention weather_collector.py already uses
-    correctly for the regular forecast endpoint (request
-    `temperature_2m_max`, models are a separate `models=` parameter,
-    and the RESPONSE comes back with model-suffixed keys).
+    SECOND FIX (real error from a second live run): the first fix
+    (removing the model suffix from the variable name) wasn't the whole
+    problem. Fetched Open-Meteo's actual docs page directly
+    (open-meteo.com/en/docs/previous-runs-api) rather than guessing a
+    third time, and found two real structural differences from what
+    was assumed:
 
-    The exact response column naming for the previous-runs endpoint
-    specifically hasn't been confirmed against a live call yet, so the
-    caller (run_pilot) takes whatever columns actually come back
-    generically rather than assuming a specific name -- if this is
-    still slightly off, the next run's printed column list will show
-    exactly what to fix instead of failing blind a second time.
+    1. This endpoint's documented example ONLY uses HOURLY variables
+       (hourly=temperature_2m,temperature_2m_previous_day1,...) -- there
+       is no daily temperature_2m_max_previous_dayN variant listed
+       anywhere in the docs. So we now request the HOURLY series and
+       compute the daily max ourselves (grouped by the city's LOCAL
+       calendar day, matching how Polymarket's own settlement is
+       defined -- see SCHEMA.md's local-day-boundary notes).
+    2. The documented example uses `past_days`/`forecast_days`, not
+       `start_date`/`end_date`. Switched to match.
+
+    `models=` was NOT shown in the docs' minimal example, but the page
+    states "supports the same models as the Weather Forecast API" --
+    kept it, since that's consistent with how every other endpoint in
+    this project works, and the diagnostic column-name print below will
+    make it obvious immediately if this assumption is still wrong.
     """
-    daily_vars = [f"temperature_2m_max_previous_day{d}" for d in LEAD_DAYS]
+    hourly_vars = ["temperature_2m"] + [f"temperature_2m_previous_day{d}" for d in LEAD_DAYS]
 
     try:
         res = requests.get(
             PREVIOUS_RUNS_BASE,
             params={
                 "latitude": lat, "longitude": lon, "timezone": tz,
-                "start_date": start_date, "end_date": end_date,
+                "past_days": past_days, "forecast_days": 1,
                 "models": "ecmwf_ifs025,gfs_seamless",
-                "daily": ",".join(daily_vars),
+                "hourly": ",".join(hourly_vars),
             },
             timeout=30,
         )
@@ -189,12 +193,21 @@ def fetch_previous_runs(lat: float, lon: float, tz: str, start_date: str, end_da
             print(f"    [open-meteo previous-runs] HTTP {res.status_code}: {res.text[:300]}")
             return pd.DataFrame()
         data = res.json()
-        daily = data.get("daily", {})
-        if not daily or "time" not in daily:
-            print("    [open-meteo previous-runs] Unexpected response shape, no 'daily.time' found.")
+        hourly = data.get("hourly", {})
+        if not hourly or "time" not in hourly:
+            print("    [open-meteo previous-runs] Unexpected response shape, no 'hourly.time' found.")
             return pd.DataFrame()
-        print(f"    [open-meteo previous-runs] response columns: {list(daily.keys())}")
-        return pd.DataFrame(daily)
+        print(f"    [open-meteo previous-runs] response columns: {list(hourly.keys())}")
+
+        hourly_df = pd.DataFrame(hourly)
+        hourly_df["time"] = pd.to_datetime(hourly_df["time"])
+        # Group by LOCAL calendar day (the API's `timezone` param already
+        # returns timestamps in local time, so a plain date() grouping is
+        # correct here -- no further tz conversion needed).
+        hourly_df["local_date"] = hourly_df["time"].dt.date.astype(str)
+        value_cols = [c for c in hourly_df.columns if c not in ("time", "local_date")]
+        daily_df = hourly_df.groupby("local_date")[value_cols].max().reset_index()
+        return daily_df.rename(columns={"local_date": "time"})
     except Exception as e:
         print(f"    [open-meteo previous-runs] fetch failed: {e}")
         return pd.DataFrame()
@@ -209,10 +222,8 @@ def run_pilot():
     print("Step 1/2: fetching Open-Meteo previous-runs forecast series (one call)...")
     from weather_collector import CITIES  # reuse the already-corrected station coordinates
     city_info = CITIES[PILOT_CITY]
-    prev_runs_df = fetch_previous_runs(
-        city_info["lat"], city_info["lon"], PILOT_TZ,
-        dates[-1].isoformat(), dates[0].isoformat(),
-    )
+    past_days_needed = (today - dates[-1]).days + 1
+    prev_runs_df = fetch_previous_runs(city_info["lat"], city_info["lon"], PILOT_TZ, past_days_needed)
     if prev_runs_df.empty:
         print("  FAILED -- no previous-runs data returned. Stopping pilot here; nothing written.")
         return

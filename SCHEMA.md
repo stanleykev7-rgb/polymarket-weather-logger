@@ -628,3 +628,33 @@ the outgoing `daily` param has no model suffix, `models` is sent
 separately) and re-ran the full end-to-end pilot test -- unchanged
 behavior otherwise, correctly produced 4 rows from a 14-day window with
 a mix of resolved/unresolved dates.
+
+## Backfill pilot: second real error, fixed by reading actual docs directly (2026-08)
+
+**Real error from your second live run**: still HTTP 400, same error
+class, even after removing the model suffix. Rather than guess a third
+time, fetched Open-Meteo's actual Previous Runs API docs page directly
+and found two real structural mistakes:
+
+1. **This endpoint only documents HOURLY variables with the
+   `_previous_dayN` suffix** (`hourly=temperature_2m,temperature_2m_previous_day1,...`)
+   -- there's no daily `temperature_2m_max_previous_dayN` variant
+   anywhere in the docs. Fixed by requesting the hourly series and
+   computing the daily max ourselves, grouped by the city's LOCAL
+   calendar day (consistent with how Polymarket's own settlement is
+   defined elsewhere in this project).
+2. **The documented example uses `past_days`/`forecast_days`**, not
+   `start_date`/`end_date`. Switched to match.
+
+`models=` still isn't shown in the docs' own minimal example, but the
+page states the endpoint "supports the same models as the Weather
+Forecast API" -- kept it for consistency with every other endpoint in
+this project. The diagnostic column-name print (added in the first fix)
+will make it immediately obvious if this specific assumption is still
+wrong on the next run.
+
+**Re-verified**: tested the hourly-to-daily-max aggregation against a
+constructed response with a known peak hour (confirmed it correctly
+picks the actual daily maximum, not just any hourly value), confirmed
+outgoing request params now match the documented pattern exactly, and
+re-ran the full end-to-end pilot test -- unchanged behavior otherwise.
